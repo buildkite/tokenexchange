@@ -131,6 +131,11 @@ exponential backoff from 1 second up to 30 seconds, capped at token expiry.
 Expired tokens and caller cancellation errors are never masked. When a logger
 is configured, refresh fallback and recovery are logged.
 
+Concurrent refreshes are coalesced. While a proactive refresh is in progress,
+other callers immediately receive the unexpired cached token. Callers waiting
+for an initial mint or an expired-token refresh can cancel their own context
+without canceling or waiting for the in-flight refresh.
+
 ## Examples
 
 - [`examples/jwks`](examples/jwks) — convert a PEM public/private key into a
@@ -151,7 +156,7 @@ go run ./examples/mint \
 |-------------|---------|
 | `Exchanger` | Signs the JWT assertion and performs the exchange. Implements `Source`. |
 | `Source` | `Token(ctx) (*Token, error)` — anything that supplies tokens. |
-| `CachedSource` | Caches a token and refreshes within a grace window. Concurrency-safe. Optional `Logger` warns on cache-thrash. |
+| `CachedSource` | Caches and coalesces token refreshes. Concurrency-safe. Optional `Logger` reports cache-thrash and refresh recovery. |
 | `Transport` | Origin-scoped `http.RoundTripper` that injects `Authorization: Bearer`. |
 | `NewClient(Source, ...allowedOrigins)` | Convenience `*http.Client` built from a `Transport`; defaults to official Buildkite API origins. |
 | `LoadPrivateKey` / `ParsePrivateKey` | Parse PKCS#1, PKCS#8, or SEC1 EC PEM keys. |

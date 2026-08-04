@@ -25,6 +25,13 @@ type Source interface {
 	Token(ctx context.Context) (*Token, error)
 }
 
+type refreshCall struct {
+	done         chan struct{}
+	token        *Token
+	err          error
+	retryWaiters bool
+}
+
 // CachedSource wraps a [Source] and caches the minted token, only calling the
 // underlying source when the cached token is missing or about to expire within
 // the refresh grace window.
@@ -44,6 +51,7 @@ type CachedSource struct {
 	current         *Token
 	retryAt         time.Time
 	refreshFailures int
+	refreshing      *refreshCall
 	warnOnce        sync.Once
 	now             func() time.Time
 }
@@ -66,39 +74,100 @@ func NewCachedSourceGrace(source Source, grace time.Duration) *CachedSource {
 // Token returns the cached token if it is still valid, otherwise it mints and
 // caches a fresh one. If a proactive refresh fails, the existing token is
 // returned while it remains unexpired and refreshes are retried with backoff.
-// Concurrent callers are serialized.
+// Concurrent refreshes are coalesced. Callers continue using an unexpired token
+// while a refresh is in progress; callers waiting for a required refresh can
+// stop waiting by canceling their context.
 func (c *CachedSource) Token(ctx context.Context) (*Token, error) {
 	if c == nil {
 		return nil, fmt.Errorf("tokenexchange: CachedSource is nil")
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	for {
+		c.mu.Lock()
+		now := c.clock()
+		if c.current.validAt(now, c.grace) {
+			tok := c.current
+			c.mu.Unlock()
+			return tok, nil
+		}
+		if c.current.validAt(now, 0) && now.Before(c.retryAt) {
+			tok := c.current
+			c.mu.Unlock()
+			return tok, nil
+		}
 
-	now := c.clock()
-	if c.current.validAt(now, c.grace) {
-		return c.current, nil
-	}
-	if c.current.validAt(now, 0) && now.Before(c.retryAt) {
-		return c.current, nil
-	}
+		if call := c.refreshing; call != nil {
+			if c.current.validAt(now, 0) {
+				tok := c.current
+				c.mu.Unlock()
+				return tok, nil
+			}
+			c.mu.Unlock()
 
-	if c.source == nil {
-		return nil, fmt.Errorf("tokenexchange: CachedSource source is nil")
-	}
+			select {
+			case <-call.done:
+				if call.retryWaiters {
+					continue
+				}
+				return call.token, call.err
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
 
-	tok, err := c.source.Token(ctx)
-	if err != nil {
+		if c.source == nil {
+			c.mu.Unlock()
+			return nil, fmt.Errorf("tokenexchange: CachedSource source is nil")
+		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
+			c.mu.Unlock()
 			return nil, ctxErr
 		}
 
-		now = c.clock()
+		call := &refreshCall{done: make(chan struct{})}
+		c.refreshing = call
+		source := c.source
+		c.mu.Unlock()
+		defer func() {
+			c.mu.Lock()
+			if c.refreshing == call {
+				// Source.Token panicked. Preserve the panic for the initiating
+				// caller, but unblock other callers so the cache can recover.
+				call.retryWaiters = true
+				c.refreshing = nil
+				close(call.done)
+			}
+			c.mu.Unlock()
+		}()
+
+		tok, err := source.Token(ctx)
+
+		c.mu.Lock()
+		func() {
+			defer c.mu.Unlock()
+			call.token, call.err, call.retryWaiters = c.finishRefresh(ctx, tok, err)
+			c.refreshing = nil
+			close(call.done)
+		}()
+		return call.token, call.err
+	}
+}
+
+// finishRefresh updates cache state after a refresh. The caller must hold c.mu.
+func (c *CachedSource) finishRefresh(ctx context.Context, tok *Token, err error) (*Token, error, bool) {
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// The refresh belonged to this caller's context. Other callers that
+			// needed a token should retry rather than inherit its cancellation.
+			return nil, ctxErr, true
+		}
+
+		now := c.clock()
 		if c.current.validAt(now, 0) {
 			c.deferRefresh(now, err)
-			return c.current, nil
+			return c.current, nil, false
 		}
-		return nil, err
+		return nil, err, false
 	}
 
 	failedAttempts := c.refreshFailures
@@ -111,7 +180,7 @@ func (c *CachedSource) Token(ctx context.Context) (*Token, error) {
 			"failed_attempts", failedAttempts,
 		)
 	}
-	return tok, nil
+	return tok, nil, false
 }
 
 func (c *CachedSource) clock() time.Time {
