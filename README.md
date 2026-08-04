@@ -1,11 +1,8 @@
 # tokenexchange
 
-A small, dependency-light Go library for [Buildkite OAuth Token Exchange][docs] (RFC 8693). It signs a JWT assertion (RFC 7523) with your application's private key, exchanges it at the Buildkite token endpoint for a short-lived, scoped API token (prefixed `bktx_`), and hands you an `*http.Client` that authenticates requests to allowed Buildkite API origins on behalf of a user.
+`tokenexchange` is a small Go library for [Buildkite OAuth Token Exchange][docs]. It signs an assertion, exchanges it for a short-lived Buildkite API token, and adds that token to HTTP requests.
 
-The package is intentionally **independent of any Buildkite API client**. Its integration currency is an `http.RoundTripper` (`Transport`) and an `*http.Client` (`NewClient`). That means you can use it:
-
-- standalone against the **GraphQL API**, **Package Registries**, or raw HTTP calls to allowed origins, and
-- with official packages, such as [`go-buildkite`][go-buildkite] via its `WithHTTPClient` option, for the REST API, without forcing a dependency on `go-buildkite` (or on this library) in either direction
+It works with plain `net/http` and does not depend on a Buildkite API client.
 
 ## Install
 
@@ -13,32 +10,17 @@ The package is intentionally **independent of any Buildkite API client**. Its in
 go get github.com/buildkite/tokenexchange
 ```
 
-## Setup
+## Before you start
 
-To use Token Exchange you need a Token Exchange application configured in Buildkite, which requires your public key in [JWKS][jwks] format. See the [Buildkite docs][docs] for the full configuration (grantable scopes, default scopes, allowed IPs, max TTL).
+Create a Token Exchange app in Buildkite and register your public key as a JWKS. The [Buildkite docs][docs] cover scopes, IP restrictions, and token lifetimes. This library handles the exchange at runtime; it does not create or configure the app.
 
-**1. Generate a key pair** (RSA or ECDSA P-256):
-
-```bash
-# RSA (2048-bit)
-openssl genrsa -out private_key.pem 2048
-openssl rsa -in private_key.pem -pubout -out public_key.pem
-
-# or ECDSA (P-256)
-openssl ecparam -name prime256v1 -genkey -noout -out private_key.pem
-openssl ec -in private_key.pem -pubout -out public_key.pem
-```
-
-**2. Convert the public key to JWKS** using the bundled
-[`examples/jwks`](examples/jwks) tool, then register the output with your
-Buildkite application:
+The [`examples/jwks`](examples/jwks) command can convert a PEM public or private key into a JWKS:
 
 ```bash
-# From the public key, or straight from the private key (public is derived):
 go run ./examples/jwks -key public_key.pem -kid my-key-1
 ```
 
-The `-kid` you choose must match the `KeyID` you set on the `Exchanger` so Buildkite can select the right key. Keep `private_key.pem` with your application; only the JWKS (public key) is registered with Buildkite.
+Keep the private key with your application. The key ID must match the `KeyID` used below.
 
 ## Usage
 
@@ -49,23 +31,20 @@ if err != nil {
 }
 
 ex := &tokenexchange.Exchanger{
-	ClientID:   "0123456789abcdef0123", // Token Exchange application client ID
-	OrgSlug:    "my-org",               // organization slug from the URL
-	UserEmail:  "user@example.com",     // user to act as
-	KeyID:      "my-key-1",             // JWK "kid" (recommended)
+	ClientID:   "0123456789abcdef0123",
+	OrgSlug:    "my-org",
+	UserEmail:  "user@example.com",
+	KeyID:      "my-key-1",
 	Scopes:     []string{"read_pipelines", "read_builds"},
 	PrivateKey: signer,
 }
 
-// Wrap in a CachedSource so tokens are reused until close to expiry,
-// as recommended by the Buildkite docs. Safe for concurrent use.
+// Cache and reuse tokens rather than exchanging one for every request.
 src := tokenexchange.NewCachedSource(ex)
-
-// An *http.Client scoped to the official Buildkite API origins.
 httpClient := tokenexchange.NewClient(src)
 ```
 
-### With go-buildkite (REST)
+Use `httpClient` directly for REST, GraphQL, Package Registries, or other HTTP requests. To use it with [`go-buildkite`][go-buildkite]:
 
 ```go
 client, err := buildkite.NewOpts(
@@ -73,117 +52,52 @@ client, err := buildkite.NewOpts(
 )
 ```
 
-Do **not** also pass `buildkite.WithTokenAuth(...)` — the transport supplies the `Authorization` header itself.
+Do not also use `buildkite.WithTokenAuth`; this client already sets the `Authorization` header.
 
-### Standalone (GraphQL, registries, raw HTTP)
+## Where tokens are sent
 
-```go
-// The same client works for GraphQL and other allowed Buildkite origins.
-body := strings.NewReader(`{"query":"{ viewer { user { name } } }"}`)
-req, _ := http.NewRequest(http.MethodPost, "https://graphql.buildkite.com/v1", body)
-req.Header.Set("Content-Type", "application/json")
-
-resp, err := httpClient.Do(req) // Authorization: Bearer bktx_... added automatically
-```
-
-### Destination scoping
-
-To prevent credentials leaking through client reuse or cross-origin redirects,
-`Transport` only attaches tokens to these HTTPS origins by default:
+By default, `NewClient` only authenticates requests to:
 
 - `https://api.buildkite.com`
 - `https://graphql.buildkite.com`
 - `https://packages.buildkite.com`
 
-Requests to any other origin are still sent, but without obtaining or attaching
-a token. This allows redirects to presigned storage URLs to work without
-forwarding the Buildkite credential.
+Other requests are sent without a token. This prevents a token from leaking through client reuse or a cross-origin redirect.
 
-For a custom API origin, pass it to `NewClient`. Supplying one or more origins
-replaces the defaults:
+Pass custom origins to `NewClient` when needed. They replace the defaults:
 
 ```go
 httpClient := tokenexchange.NewClient(src, "https://buildkite.example.com")
 ```
 
-Origins must have the form `scheme://host`, including a port when required.
-When constructing `Transport` directly, configure the equivalent
-`AllowedOrigins` field.
+Origins must use the form `scheme://host`, including a port when required.
 
-## Caching and short token TTLs
+## Caching and refresh
 
-`CachedSource` reuses a token until it is within a grace window of expiry (`DefaultRefreshGrace`, 60s). If the requested TTL does not exceed that window (for example `expires_in=30s`), each sequential cache lookup attempts another refresh. Concurrent lookups are still coalesced, but token reuse is largely defeated.
+Calling `Exchanger.Token` always performs a network request. `CachedSource` keeps the token in memory, coalesces concurrent refreshes, and refreshes before expiry as recommended by Buildkite.
 
-This is a valid configuration, not an error — so the library does not reject it. Instead, attach an `*slog.Logger` and `CachedSource` warns once if it detects the situation:
+The default refresh grace is 60 seconds. For shorter token lifetimes, use `NewCachedSourceGrace`; otherwise every lookup may attempt a refresh. You can also attach an `*slog.Logger` to `CachedSource` to see refresh failures and recovery.
 
-```go
-src := tokenexchange.NewCachedSource(ex)
-src.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
-// WARN tokenexchange: minted token lifetime does not exceed the cache refresh
-// grace; caching is ineffective for sequential lookups ...
-```
+If a proactive refresh fails, an unexpired token remains available while refreshes are retried with backoff. A `401 Unauthorized` response invalidates the cached token for the next request. The failed request is not retried.
 
-Use a longer token TTL, or a smaller grace via `NewCachedSourceGrace`.
+`Source` connects the exchanger, cache, and transport. It represents a source of tokens minted through Buildkite Token Exchange; `Exchanger` and `CachedSource` both implement it.
 
-If a proactive refresh fails while the cached token is still unexpired,
-`CachedSource` continues returning that token and retries refresh with
-exponential backoff from 1 second up to 30 seconds, capped at token expiry.
-Expired tokens and caller cancellation errors are never masked. When a logger
-is configured, refresh fallback and recovery are logged.
+## Errors
 
-Concurrent refreshes are coalesced. While a proactive refresh is in progress,
-other callers immediately receive the unexpired cached token. Callers waiting
-for an initial mint or an expired-token refresh can cancel their own context
-without canceling or waiting for the in-flight refresh.
-
-When used with `CachedSource`, a `401 Unauthorized` response causes `Transport`
-to invalidate that token so the next request refreshes it. The failed request
-is not retried automatically, avoiding unsafe replay of its body.
-
-## Examples
-
-- [`examples/jwks`](examples/jwks) — convert a PEM public/private key into a
-  JWKS for registering your application (see [Setup](#setup)).
-- [`examples/mint`](examples/mint) — a runnable end-to-end token exchange that
-  makes authenticated REST calls:
-
-```bash
-go run ./examples/mint \
-  -client-id CLIENT_ID -private-key key.pem \
-  -org my-org -user-email dev@example.com \
-  /v2/organizations/my-org/pipelines
-```
-
-## API
-
-| Type / func | Purpose |
-|-------------|---------|
-| `Exchanger` | Signs the JWT assertion and performs the exchange. Implements `Source`. |
-| `Source` | `Token(ctx) (*Token, error)` — anything that supplies tokens. |
-| `CachedSource` | Caches and coalesces token refreshes. Concurrency-safe. Optional `Logger` reports cache-thrash, refresh failures, and recovery. |
-| `Transport` | Origin-scoped `http.RoundTripper` that injects `Authorization: Bearer`. |
-| `NewClient(Source, ...allowedOrigins)` | Convenience `*http.Client` built from a `Transport`; defaults to official Buildkite API origins. |
-| `LoadPrivateKey` / `ParsePrivateKey` | Parse PKCS#1, PKCS#8, or SEC1 EC PEM keys. |
-| `TokenError` | Typed RFC 6749 §5.2 error (`Code`, `Description`, `StatusCode`). |
-
-Supported signing algorithms: **RS256** (RSA) and **ES256** (ECDSA P-256).
-
-## Error handling
-
-When no valid cached token can be used, OAuth error responses surface as a `*TokenError`; network, malformed-response, and other failures surface as ordinary wrapped errors.
+OAuth errors are returned as `*TokenError`. Network and malformed-response errors are returned as wrapped Go errors.
 
 ```go
-tok, err := src.Token(ctx)
+_, err := src.Token(ctx)
 var te *tokenexchange.TokenError
 if errors.As(err, &te) && te.Code == tokenexchange.ErrCodeInvalidScope {
-	// requested scopes exceed the app's grantable scopes
+	// The requested scopes exceed the app's grantable scopes.
 }
 ```
 
-Successful responses are also validated before use: `issued_token_type` must
-identify an access token, `token_type` must be `Bearer` (case-insensitive), and
-`expires_in` must be a positive lifetime representable by Go's `time.Duration`.
+## Examples
+
+- [`examples/jwks`](examples/jwks) converts a PEM key into a JWKS
+- [`examples/mint`](examples/mint) performs an exchange and makes an authenticated REST request
 
 [docs]: https://buildkite.com/docs/apis/oauth-token-exchange
 [go-buildkite]: https://github.com/buildkite/go-buildkite
-[jwks]: https://datatracker.ietf.org/doc/html/rfc7517
