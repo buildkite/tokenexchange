@@ -1,0 +1,8 @@
+steps:
+  - label: ":go: Verify"
+    command:
+      - test -z "$(gofmt -l .)"
+      - go vet ./...
+      - go test -race ./...
+    plugins:
+      - mise#v1.1.5: ~
