@@ -49,6 +49,18 @@ type tokenResult struct {
 	err   error
 }
 
+type countingReader struct {
+	bytesRead int
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	for i := range p {
+		p[i] = 'x'
+	}
+	r.bytesRead += len(p)
+	return len(p), nil
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -187,6 +199,27 @@ func TestTokenErrorResponse(t *testing.T) {
 	}
 	if te.Code != ErrCodeInvalidScope || te.StatusCode != http.StatusBadRequest {
 		t.Errorf("TokenError = %+v", te)
+	}
+}
+
+func TestTokenResponseBodyLimit(t *testing.T) {
+	body := &countingReader{}
+	ex := newExchanger(testKey(t), "https://token.example.test")
+	ex.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(body),
+			Request:    req,
+		}, nil
+	})}
+
+	_, err := ex.Token(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "token response body exceeds 65536 bytes") {
+		t.Fatalf("Token error = %v, want response body limit error", err)
+	}
+	if got, want := body.bytesRead, maxTokenResponseBodyLen+1; got != want {
+		t.Errorf("read %d response bytes, want %d", got, want)
 	}
 }
 

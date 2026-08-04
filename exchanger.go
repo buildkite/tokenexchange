@@ -26,6 +26,11 @@ const assertionTTL = 5 * time.Minute
 // in an error message.
 const httpBodyPreviewLen = 256
 
+// maxTokenResponseBodyLen bounds memory used when reading a token endpoint
+// response. OAuth token and error responses are expected to be small JSON
+// documents.
+const maxTokenResponseBodyLen = 64 << 10
+
 // Exchanger mints Buildkite API tokens by signing a JWT assertion (RFC 7523)
 // and exchanging it via the OAuth 2.0 Token Exchange grant (RFC 8693).
 //
@@ -219,9 +224,12 @@ func (e *Exchanger) exchange(ctx context.Context, assertion string) (*Token, err
 		_ = resp.Body.Close()
 	}()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenResponseBodyLen+1))
 	if err != nil {
 		return nil, fmt.Errorf("tokenexchange: reading token response: %w", err)
+	}
+	if len(body) > maxTokenResponseBodyLen {
+		return nil, fmt.Errorf("tokenexchange: token response body exceeds %d bytes (HTTP %d)", maxTokenResponseBodyLen, resp.StatusCode)
 	}
 
 	if resp.StatusCode != http.StatusOK {
