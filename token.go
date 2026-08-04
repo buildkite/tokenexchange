@@ -30,11 +30,12 @@ func (t *Token) Scopes() []string { return append([]string(nil), t.scopes...) }
 // Expiry returns the absolute time at which the token expires.
 func (t *Token) Expiry() time.Time { return t.expiresAt }
 
-// valid reports whether the token exists and will not expire within grace.
+// validAt reports whether the token exists and will not expire within grace at
+// the given time.
 // It does not verify the cryptographic validity of the token contents.
-func (t *Token) valid(grace time.Duration) bool {
+func (t *Token) validAt(now time.Time, grace time.Duration) bool {
 	if t == nil || t.accessToken == "" {
 		return false
 	}
-	return time.Now().Add(grace).Before(t.expiresAt)
+	return now.Add(grace).Before(t.expiresAt)
 }

@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -36,6 +37,12 @@ type staticSource struct {
 func (s *staticSource) Token(context.Context) (*Token, error) {
 	atomic.AddInt32(&s.calls, 1)
 	return &Token{accessToken: "bktx_secret", tokenType: "Bearer"}, nil
+}
+
+type sourceFunc func(context.Context) (*Token, error)
+
+func (f sourceFunc) Token(ctx context.Context) (*Token, error) {
+	return f(ctx)
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -243,6 +250,183 @@ func TestCachedSourceNoWarnOnHealthyTTL(t *testing.T) {
 	}
 	if buf.Len() != 0 {
 		t.Errorf("unexpected log output: %q", buf.String())
+	}
+}
+
+func TestCachedSourceUsesUnexpiredTokenDuringRefreshBackoff(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	oldToken := &Token{accessToken: "bktx_old", expiresAt: now.Add(30 * time.Second)}
+	newToken := &Token{accessToken: "bktx_new", expiresAt: now.Add(time.Hour)}
+	refreshErr := errors.New("token endpoint unavailable")
+	var calls int32
+	source := sourceFunc(func(context.Context) (*Token, error) {
+		switch atomic.AddInt32(&calls, 1) {
+		case 1:
+			return oldToken, nil
+		case 2, 3:
+			return nil, refreshErr
+		default:
+			return newToken, nil
+		}
+	})
+
+	var logs bytes.Buffer
+	src := NewCachedSourceGrace(source, time.Minute)
+	src.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	src.now = func() time.Time { return now }
+
+	if tok, err := src.Token(context.Background()); err != nil || tok != oldToken {
+		t.Fatalf("initial Token = (%v, %v), want old token", tok, err)
+	}
+	if tok, err := src.Token(context.Background()); err != nil || tok != oldToken {
+		t.Fatalf("failed refresh Token = (%v, %v), want old token", tok, err)
+	}
+	if tok, err := src.Token(context.Background()); err != nil || tok != oldToken {
+		t.Fatalf("backoff Token = (%v, %v), want old token", tok, err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("source called %d times during first backoff, want 2", got)
+	}
+
+	now = now.Add(time.Second)
+	if tok, err := src.Token(context.Background()); err != nil || tok != oldToken {
+		t.Fatalf("second failed refresh Token = (%v, %v), want old token", tok, err)
+	}
+	now = now.Add(time.Second)
+	if tok, err := src.Token(context.Background()); err != nil || tok != oldToken {
+		t.Fatalf("second backoff Token = (%v, %v), want old token", tok, err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 3 {
+		t.Fatalf("source called %d times during second backoff, want 3", got)
+	}
+
+	now = now.Add(time.Second)
+	if tok, err := src.Token(context.Background()); err != nil || tok != newToken {
+		t.Fatalf("recovered Token = (%v, %v), want new token", tok, err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 4 {
+		t.Errorf("source called %d times, want 4", got)
+	}
+	if got := strings.Count(logs.String(), "token refresh failed; using cached token"); got != 2 {
+		t.Errorf("refresh failure logged %d times, want 2; log=%q", got, logs.String())
+	}
+	if got := strings.Count(logs.String(), "token refresh recovered"); got != 1 {
+		t.Errorf("refresh recovery logged %d times, want 1; log=%q", got, logs.String())
+	}
+}
+
+func TestRefreshRetryBackoff(t *testing.T) {
+	tests := []struct {
+		failures int
+		want     time.Duration
+	}{
+		{failures: 1, want: time.Second},
+		{failures: 2, want: 2 * time.Second},
+		{failures: 5, want: 16 * time.Second},
+		{failures: 6, want: 30 * time.Second},
+		{failures: 100, want: 30 * time.Second},
+	}
+	for _, tt := range tests {
+		if got := refreshRetryBackoff(tt.failures); got != tt.want {
+			t.Errorf("refreshRetryBackoff(%d) = %s, want %s", tt.failures, got, tt.want)
+		}
+	}
+}
+
+func TestCachedSourceReturnsRefreshErrorAfterExpiry(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	oldToken := &Token{accessToken: "bktx_old", expiresAt: now.Add(time.Second)}
+	refreshErr := errors.New("token endpoint unavailable")
+	var calls int32
+	source := sourceFunc(func(context.Context) (*Token, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return oldToken, nil
+		}
+		now = now.Add(time.Second)
+		return nil, refreshErr
+	})
+	src := NewCachedSourceGrace(source, time.Minute)
+	src.now = func() time.Time { return now }
+
+	if _, err := src.Token(context.Background()); err != nil {
+		t.Fatalf("initial Token: %v", err)
+	}
+	if _, err := src.Token(context.Background()); !errors.Is(err, refreshErr) {
+		t.Fatalf("Token error = %v, want %v", err, refreshErr)
+	}
+}
+
+func TestCachedSourceDoesNotMaskCanceledRefresh(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	oldToken := &Token{accessToken: "bktx_old", expiresAt: now.Add(30 * time.Second)}
+	var calls int32
+	source := sourceFunc(func(ctx context.Context) (*Token, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return oldToken, nil
+		}
+		return nil, ctx.Err()
+	})
+	src := NewCachedSourceGrace(source, time.Minute)
+	src.now = func() time.Time { return now }
+
+	if _, err := src.Token(context.Background()); err != nil {
+		t.Fatalf("initial Token: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := src.Token(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Token error = %v, want context.Canceled", err)
+	}
+}
+
+func TestCachedSourceSerializesFailedRefresh(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	oldToken := &Token{accessToken: "bktx_old", expiresAt: now.Add(30 * time.Second)}
+	refreshErr := errors.New("token endpoint unavailable")
+	refreshStarted := make(chan struct{})
+	releaseRefresh := make(chan struct{})
+	var calls int32
+	source := sourceFunc(func(context.Context) (*Token, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return oldToken, nil
+		}
+		close(refreshStarted)
+		<-releaseRefresh
+		return nil, refreshErr
+	})
+	src := NewCachedSourceGrace(source, time.Minute)
+	src.now = func() time.Time { return now }
+
+	if _, err := src.Token(context.Background()); err != nil {
+		t.Fatalf("initial Token: %v", err)
+	}
+
+	const callers = 10
+	errCh := make(chan error, callers)
+	var wg sync.WaitGroup
+	for range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			tok, err := src.Token(context.Background())
+			if err != nil {
+				errCh <- err
+				return
+			}
+			if tok != oldToken {
+				errCh <- errors.New("Token did not return old token")
+			}
+		}()
+	}
+	<-refreshStarted
+	close(releaseRefresh)
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("source called %d times, want one initial mint and one failed refresh", got)
 	}
 }
 

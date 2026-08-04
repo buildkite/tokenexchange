@@ -125,6 +125,12 @@ src.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 Use a longer token TTL, or a smaller grace via `NewCachedSourceGrace`.
 
+If a proactive refresh fails while the cached token is still unexpired,
+`CachedSource` continues returning that token and retries refresh with
+exponential backoff from 1 second up to 30 seconds, capped at token expiry.
+Expired tokens and caller cancellation errors are never masked. When a logger
+is configured, refresh fallback and recovery are logged.
+
 ## Examples
 
 - [`examples/jwks`](examples/jwks) — convert a PEM public/private key into a
