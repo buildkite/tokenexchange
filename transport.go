@@ -15,7 +15,7 @@ import (
 // or Package Registries.
 type Transport struct {
 	// Source supplies tokens. Typically a [*CachedSource] wrapping an
-	// [*Exchanger]. Required.
+	// [*Exchanger]. Required for requests to allowed origins.
 	Source Source
 
 	// Base is the underlying RoundTripper. Defaults to http.DefaultTransport.
@@ -98,7 +98,8 @@ func closeRequestBody(req *http.Request) {
 // origins with tokens from source. It is a convenience wrapper around
 // [Transport]. If allowedOrigins is empty, the official Buildkite REST,
 // GraphQL, and Package Registries HTTPS origins are allowed. Supplying origins
-// replaces those defaults.
+// replaces those defaults. NewClient does not cache tokens; wrap an [Exchanger]
+// in a [CachedSource] before passing it as source to reuse tokens.
 //
 // Pass the result to any API client that accepts an *http.Client:
 //

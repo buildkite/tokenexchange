@@ -39,7 +39,7 @@ const maxTokenExpiresInSeconds int64 = (1<<63 - 1) / int64(time.Second)
 // and exchanging it via the OAuth 2.0 Token Exchange grant (RFC 8693).
 //
 // An Exchanger performs a network round-trip on every call to [Exchanger.Token].
-// Wrap it in a [CachedSource] (or build a client with [NewClient]) so tokens are
+// Wrap it in a [CachedSource] before passing it to [NewClient] so tokens are
 // cached and reused until close to expiry, as recommended by the Buildkite docs.
 type Exchanger struct {
 	// ClientID is the Token Exchange application's client ID. It is used as

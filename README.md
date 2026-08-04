@@ -5,7 +5,7 @@ A small, dependency-light Go library for [Buildkite OAuth Token Exchange][docs] 
 The package is intentionally **independent of any Buildkite API client**. Its integration currency is an `http.RoundTripper` (`Transport`) and an `*http.Client` (`NewClient`). That means you can use it:
 
 - standalone against the **GraphQL API**, **Package Registries**, or raw HTTP calls to allowed origins, and
-- with official packages, such as [`go-buildkite`][go-buildkite] via its `WithHTTPClient` option, for the  REST API, without forcing a dependency on `go-buildkite` (or on this library) in either direction
+- with official packages, such as [`go-buildkite`][go-buildkite] via its `WithHTTPClient` option, for the REST API, without forcing a dependency on `go-buildkite` (or on this library) in either direction
 
 ## Install
 
@@ -78,7 +78,7 @@ Do **not** also pass `buildkite.WithTokenAuth(...)` — the transport supplies t
 ### Standalone (GraphQL, registries, raw HTTP)
 
 ```go
-// The same client works for GraphQL or any other Buildkite HTTP API.
+// The same client works for GraphQL and other allowed Buildkite origins.
 body := strings.NewReader(`{"query":"{ viewer { user { name } } }"}`)
 req, _ := http.NewRequest(http.MethodPost, "https://graphql.buildkite.com/v1", body)
 req.Header.Set("Content-Type", "application/json")
@@ -112,7 +112,7 @@ When constructing `Transport` directly, configure the equivalent
 
 ## Caching and short token TTLs
 
-`CachedSource` reuses a token until it is within a grace window of expiry (`DefaultRefreshGrace`, 60s). If you request a token TTL shorter than the grace window (for example `expires_in=30s`), the cached token is always considered stale and **every call mints a new token**, defeating caching.
+`CachedSource` reuses a token until it is within a grace window of expiry (`DefaultRefreshGrace`, 60s). If the requested TTL does not exceed that window (for example `expires_in=30s`), each sequential cache lookup attempts another refresh. Concurrent lookups are still coalesced, but token reuse is largely defeated.
 
 This is a valid configuration, not an error — so the library does not reject it. Instead, attach an `*slog.Logger` and `CachedSource` warns once if it detects the situation:
 
@@ -156,7 +156,7 @@ go run ./examples/mint \
 |-------------|---------|
 | `Exchanger` | Signs the JWT assertion and performs the exchange. Implements `Source`. |
 | `Source` | `Token(ctx) (*Token, error)` — anything that supplies tokens. |
-| `CachedSource` | Caches and coalesces token refreshes. Concurrency-safe. Optional `Logger` reports cache-thrash and refresh recovery. |
+| `CachedSource` | Caches and coalesces token refreshes. Concurrency-safe. Optional `Logger` reports cache-thrash, refresh failures, and recovery. |
 | `Transport` | Origin-scoped `http.RoundTripper` that injects `Authorization: Bearer`. |
 | `NewClient(Source, ...allowedOrigins)` | Convenience `*http.Client` built from a `Transport`; defaults to official Buildkite API origins. |
 | `LoadPrivateKey` / `ParsePrivateKey` | Parse PKCS#1, PKCS#8, or SEC1 EC PEM keys. |
@@ -166,7 +166,7 @@ Supported signing algorithms: **RS256** (RSA) and **ES256** (ECDSA P-256).
 
 ## Error handling
 
-Failed exchanges return a `*TokenError` you can branch on:
+When no valid cached token can be used, OAuth error responses surface as a `*TokenError`; network, malformed-response, and other failures surface as ordinary wrapped errors.
 
 ```go
 tok, err := src.Token(ctx)

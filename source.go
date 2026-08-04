@@ -43,8 +43,8 @@ type CachedSource struct {
 	grace  time.Duration
 
 	// Logger, if non-nil, reports refresh failures and recovery. It also
-	// receives a one-time Warn when a freshly minted token has a lifetime
-	// shorter than the refresh grace window. Defaults to nil (no logging).
+	// receives a one-time Warn when a freshly minted token has a lifetime no
+	// longer than the refresh grace window. Defaults to nil (no logging).
 	Logger *slog.Logger
 
 	mu              sync.Mutex
@@ -219,7 +219,7 @@ func refreshRetryBackoff(failures int) time.Duration {
 }
 
 // warnIfThrashing logs a single warning if the minted token's lifetime is no
-// longer than the grace window, which would cause a refresh on every call.
+// longer than the grace window, causing sequential lookups to keep refreshing.
 func (c *CachedSource) warnIfThrashing(tok *Token, now time.Time) {
 	if c.Logger == nil || c.grace <= 0 {
 		return
@@ -229,7 +229,7 @@ func (c *CachedSource) warnIfThrashing(tok *Token, now time.Time) {
 		return
 	}
 	c.warnOnce.Do(func() {
-		c.Logger.Warn("tokenexchange: minted token lifetime is shorter than the cache refresh grace; caching is ineffective and every request will mint a new token",
+		c.Logger.Warn("tokenexchange: minted token lifetime does not exceed the cache refresh grace; caching is ineffective for sequential lookups, which will repeatedly attempt refreshes",
 			"token_lifetime", lifetime.Round(time.Second),
 			"refresh_grace", c.grace,
 		)

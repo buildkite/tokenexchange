@@ -9,8 +9,8 @@ import (
 	"os"
 )
 
-// LoadPrivateKey reads a PEM-encoded RSA or ECDSA private key from path and
-// returns it as a [crypto.Signer] suitable for [Exchanger.PrivateKey].
+// LoadPrivateKey reads a PEM-encoded private key from path and returns it as a
+// [crypto.Signer]. For use with [Exchanger], the key must be RSA or ECDSA P-256.
 func LoadPrivateKey(path string) (crypto.Signer, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -19,9 +19,9 @@ func LoadPrivateKey(path string) (crypto.Signer, error) {
 	return ParsePrivateKey(data)
 }
 
-// ParsePrivateKey parses a PEM-encoded RSA or ECDSA private key. It accepts
-// PKCS#1 ("RSA PRIVATE KEY"), PKCS#8 ("PRIVATE KEY"), and SEC 1 EC
-// ("EC PRIVATE KEY") encodings.
+// ParsePrivateKey parses a PEM-encoded private key into a [crypto.Signer]. It
+// accepts PKCS#1 ("RSA PRIVATE KEY"), PKCS#8 ("PRIVATE KEY"), and SEC 1 EC
+// ("EC PRIVATE KEY") encodings. [Exchanger] supports RSA and ECDSA P-256 keys.
 func ParsePrivateKey(pemData []byte) (crypto.Signer, error) {
 	block, _ := pem.Decode(pemData)
 	if block == nil {
