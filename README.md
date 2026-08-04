@@ -33,7 +33,7 @@ if err != nil {
 ex := &tokenexchange.Exchanger{
 	ClientID:   "0123456789abcdef0123",
 	OrgSlug:    "my-org",
-	UserEmail:  "user@example.com",
+	UserEmail:  "user@example.com", // Or set UserUUID instead.
 	KeyID:      "my-key-1",
 	Scopes:     []string{"read_pipelines", "read_builds"},
 	PrivateKey: signer,
@@ -43,6 +43,8 @@ ex := &tokenexchange.Exchanger{
 src := tokenexchange.NewCachedSource(ex)
 httpClient := tokenexchange.NewClient(src)
 ```
+
+Set exactly one of `UserEmail` or `UserUUID`. The organization members REST API returns each user's UUID as `id`.
 
 Use `httpClient` directly for REST, GraphQL, Package Registries, or other HTTP requests. To use it with [`go-buildkite`][go-buildkite]:
 

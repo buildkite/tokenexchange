@@ -35,7 +35,8 @@ func main() {
 		clientID       = flag.String("client-id", "", "Token Exchange application client ID (required)")
 		privateKeyFile = flag.String("private-key", "", "path to RSA or EC private key PEM (required)")
 		orgSlug        = flag.String("org", "", "Buildkite organization slug (required)")
-		userEmail      = flag.String("user-email", "", "Buildkite user email to act as (required)")
+		userEmail      = flag.String("user-email", "", "Buildkite user email to act as (required unless -user-uuid is set)")
+		userUUID       = flag.String("user-uuid", "", "Buildkite user UUID to act as (required unless -user-email is set)")
 		kid            = flag.String("kid", "", "JWT key ID (kid) header; should match the kid in your JWKS")
 		scopes         = flag.String("scopes", "read_pipelines read_builds", "space-delimited scopes (empty uses app defaults)")
 		tokenEndpoint  = flag.String("token-endpoint", tokenexchange.DefaultEndpoint, "OAuth token endpoint")
@@ -44,7 +45,11 @@ func main() {
 	)
 	flag.Parse()
 
-	if *clientID == "" || *privateKeyFile == "" || *orgSlug == "" || *userEmail == "" {
+	if *clientID == "" || *privateKeyFile == "" || *orgSlug == "" {
+		flag.Usage()
+		os.Exit(1)
+	}
+	if (*userEmail == "" && *userUUID == "") || (*userEmail != "" && *userUUID != "") {
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -64,6 +69,7 @@ func main() {
 		ClientID:   *clientID,
 		OrgSlug:    *orgSlug,
 		UserEmail:  *userEmail,
+		UserUUID:   *userUUID,
 		KeyID:      *kid,
 		Scopes:     scopeList,
 		ExpiresIn:  *expiresIn,

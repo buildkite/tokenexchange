@@ -248,6 +248,36 @@ func TestExchangerToken(t *testing.T) {
 	}
 }
 
+func TestExchangerUserUUID(t *testing.T) {
+	key := testKey(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		form, _ := url.ParseQuery(string(body))
+		if got := form.Get("subject_token"); got != "0185dbbf-8447-4f72-ac7e-4ea3c2ec8381" {
+			t.Errorf("subject_token = %q", got)
+		}
+		if got := form.Get("subject_token_type"); got != subjectTokenTypeUserUUID {
+			t.Errorf("subject_token_type = %q", got)
+		}
+		if err := json.NewEncoder(w).Encode(tokenEndpointResponse{
+			AccessToken:     "bktx_secret",
+			IssuedTokenType: issuedTokenTypeAccessToken,
+			TokenType:       "Bearer",
+			ExpiresIn:       3600,
+		}); err != nil {
+			t.Errorf("encoding response: %v", err)
+		}
+	}))
+	defer srv.Close()
+
+	ex := newExchanger(key, srv.URL)
+	ex.UserEmail = ""
+	ex.UserUUID = "0185dbbf-8447-4f72-ac7e-4ea3c2ec8381"
+	if _, err := ex.Token(context.Background()); err != nil {
+		t.Fatalf("Token: %v", err)
+	}
+}
+
 func TestExchangerAssertionDefaults(t *testing.T) {
 	now := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
 	ex := newExchanger(testKey(t), "")
@@ -429,7 +459,8 @@ func TestValidateRequiredFields(t *testing.T) {
 	}{
 		{name: "ClientID", field: "ClientID", clear: func(ex *Exchanger) { ex.ClientID = "" }},
 		{name: "OrgSlug", field: "OrgSlug", clear: func(ex *Exchanger) { ex.OrgSlug = "" }},
-		{name: "UserEmail", field: "UserEmail", clear: func(ex *Exchanger) { ex.UserEmail = "" }},
+		{name: "subject", field: "either UserEmail or UserUUID is required", clear: func(ex *Exchanger) { ex.UserEmail = "" }},
+		{name: "multiple subjects", field: "UserEmail and UserUUID are mutually exclusive", clear: func(ex *Exchanger) { ex.UserUUID = "user-uuid" }},
 		{name: "PrivateKey", field: "PrivateKey", clear: func(ex *Exchanger) { ex.PrivateKey = nil }},
 	}
 

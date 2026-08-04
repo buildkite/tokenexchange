@@ -50,10 +50,14 @@ type Exchanger struct {
 	// display name). It is sent as the request "audience" parameter. Required.
 	OrgSlug string
 
-	// UserEmail is the email of the Buildkite user to act as. It is sent as
-	// the "subject_token". The user must be an active organization member with
-	// a verified email. Required.
+	// UserEmail is the verified email of the Buildkite user to act as. The user
+	// must be an active organization member. Set either UserEmail or UserUUID,
+	// but not both.
 	UserEmail string
+
+	// UserUUID is the UUID of the Buildkite user to act as. The user must be an
+	// active organization member. Set either UserUUID or UserEmail, but not both.
+	UserUUID string
 
 	// PrivateKey signs the JWT assertion. Must be an *rsa.PrivateKey (RS256) or
 	// a P-256 *ecdsa.PrivateKey (ES256). Required.
@@ -113,8 +117,10 @@ func (e *Exchanger) validate() error {
 		return fmt.Errorf("tokenexchange: ClientID is required")
 	case e.OrgSlug == "":
 		return fmt.Errorf("tokenexchange: OrgSlug is required")
-	case e.UserEmail == "":
-		return fmt.Errorf("tokenexchange: UserEmail is required")
+	case e.UserEmail == "" && e.UserUUID == "":
+		return fmt.Errorf("tokenexchange: either UserEmail or UserUUID is required")
+	case e.UserEmail != "" && e.UserUUID != "":
+		return fmt.Errorf("tokenexchange: UserEmail and UserUUID are mutually exclusive")
 	case e.PrivateKey == nil:
 		return fmt.Errorf("tokenexchange: PrivateKey is required")
 	case e.ExpiresIn < 0:
@@ -204,12 +210,19 @@ type tokenEndpointError struct {
 }
 
 func (e *Exchanger) exchange(ctx context.Context, assertion string) (*Token, error) {
+	subjectToken := e.UserEmail
+	subjectTokenType := subjectTokenTypeUserEmail
+	if e.UserUUID != "" {
+		subjectToken = e.UserUUID
+		subjectTokenType = subjectTokenTypeUserUUID
+	}
+
 	params := url.Values{
 		"grant_type":            {grantTypeTokenExchange},
 		"client_assertion_type": {clientAssertionTypeJWTBearer},
 		"client_assertion":      {assertion},
-		"subject_token":         {e.UserEmail},
-		"subject_token_type":    {subjectTokenTypeUserEmail},
+		"subject_token":         {subjectToken},
+		"subject_token_type":    {subjectTokenType},
 		"audience":              {e.OrgSlug},
 	}
 	if len(e.Scopes) > 0 {
