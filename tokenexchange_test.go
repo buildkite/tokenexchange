@@ -116,9 +116,9 @@ func fakeEndpoint(t *testing.T, key *rsa.PrivateKey, expiresIn int) (*httptest.S
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(tokenEndpointResponse{
 			AccessToken:     "bktx_secret",
-			IssuedTokenType: "urn:ietf:params:oauth:token-type:access_token",
+			IssuedTokenType: issuedTokenTypeAccessToken,
 			TokenType:       "Bearer",
-			ExpiresIn:       expiresIn,
+			ExpiresIn:       int64(expiresIn),
 			Scope:           "read_pipelines read_builds",
 		}); err != nil {
 			t.Errorf("encoding response: %v", err)
@@ -220,6 +220,72 @@ func TestTokenResponseBodyLimit(t *testing.T) {
 	}
 	if got, want := body.bytesRead, maxTokenResponseBodyLen+1; got != want {
 		t.Errorf("read %d response bytes, want %d", got, want)
+	}
+}
+
+func TestTokenResponseValidation(t *testing.T) {
+	valid := tokenEndpointResponse{
+		AccessToken:     "bktx_secret",
+		IssuedTokenType: issuedTokenTypeAccessToken,
+		TokenType:       "Bearer",
+		ExpiresIn:       3600,
+	}
+	missingIssuedType := valid
+	missingIssuedType.IssuedTokenType = ""
+	unexpectedIssuedType := valid
+	unexpectedIssuedType.IssuedTokenType = "urn:ietf:params:oauth:token-type:refresh_token"
+	missingTokenType := valid
+	missingTokenType.TokenType = ""
+	unexpectedTokenType := valid
+	unexpectedTokenType.TokenType = "MAC"
+	zeroExpiry := valid
+	zeroExpiry.ExpiresIn = 0
+	negativeExpiry := valid
+	negativeExpiry.ExpiresIn = -1
+	overflowingExpiry := valid
+	overflowingExpiry.ExpiresIn = maxTokenExpiresInSeconds + 1
+	lowercaseBearer := valid
+	lowercaseBearer.TokenType = "bearer"
+
+	tests := []struct {
+		name     string
+		response tokenEndpointResponse
+		wantErr  string
+	}{
+		{name: "missing issued token type", response: missingIssuedType, wantErr: `unexpected issued_token_type ""`},
+		{name: "unexpected issued token type", response: unexpectedIssuedType, wantErr: "unexpected issued_token_type"},
+		{name: "missing token type", response: missingTokenType, wantErr: `unexpected token_type ""`},
+		{name: "unexpected token type", response: unexpectedTokenType, wantErr: `unexpected token_type "MAC"`},
+		{name: "zero expiry", response: zeroExpiry, wantErr: "invalid expires_in 0"},
+		{name: "negative expiry", response: negativeExpiry, wantErr: "invalid expires_in -1"},
+		{name: "overflowing expiry", response: overflowingExpiry, wantErr: "exceeding the supported maximum"},
+		{name: "case-insensitive bearer", response: lowercaseBearer},
+	}
+
+	key := testKey(t)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewEncoder(w).Encode(tt.response); err != nil {
+					t.Errorf("encoding response: %v", err)
+				}
+			}))
+			defer srv.Close()
+
+			tok, err := newExchanger(key, srv.URL).Token(context.Background())
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("Token error = %v, want containing %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Token: %v", err)
+			}
+			if tok.Type() != "Bearer" {
+				t.Errorf("Type = %q, want normalized Bearer", tok.Type())
+			}
+		})
 	}
 }
 
@@ -782,7 +848,12 @@ func TestExpiresInParameter(t *testing.T) {
 		body, _ := io.ReadAll(r.Body)
 		form, _ := url.ParseQuery(string(body))
 		gotExpiresIn = form.Get("expires_in")
-		if err := json.NewEncoder(w).Encode(tokenEndpointResponse{AccessToken: "bktx_x", TokenType: "Bearer", ExpiresIn: 600}); err != nil {
+		if err := json.NewEncoder(w).Encode(tokenEndpointResponse{
+			AccessToken:     "bktx_x",
+			IssuedTokenType: issuedTokenTypeAccessToken,
+			TokenType:       "Bearer",
+			ExpiresIn:       600,
+		}); err != nil {
 			t.Errorf("encoding response: %v", err)
 		}
 	}))

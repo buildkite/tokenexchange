@@ -176,6 +176,10 @@ if errors.As(err, &te) && te.Code == tokenexchange.ErrCodeInvalidScope {
 }
 ```
 
+Successful responses are also validated before use: `issued_token_type` must
+identify an access token, `token_type` must be `Bearer` (case-insensitive), and
+`expires_in` must be a positive lifetime representable by Go's `time.Duration`.
+
 [docs]: https://buildkite.com/docs/apis/oauth-token-exchange
 [go-buildkite]: https://github.com/buildkite/go-buildkite
 [jwks]: https://datatracker.ietf.org/doc/html/rfc7517

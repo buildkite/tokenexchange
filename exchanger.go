@@ -31,6 +31,10 @@ const httpBodyPreviewLen = 256
 // documents.
 const maxTokenResponseBodyLen = 64 << 10
 
+// maxTokenExpiresInSeconds is the largest whole-second lifetime that can be
+// represented by time.Duration without overflow.
+const maxTokenExpiresInSeconds int64 = (1<<63 - 1) / int64(time.Second)
+
 // Exchanger mints Buildkite API tokens by signing a JWT assertion (RFC 7523)
 // and exchanging it via the OAuth 2.0 Token Exchange grant (RFC 8693).
 //
@@ -184,7 +188,7 @@ type tokenEndpointResponse struct {
 	AccessToken     string `json:"access_token"`
 	IssuedTokenType string `json:"issued_token_type"`
 	TokenType       string `json:"token_type"`
-	ExpiresIn       int    `json:"expires_in"`
+	ExpiresIn       int64  `json:"expires_in"`
 	Scope           string `json:"scope"`
 }
 
@@ -255,10 +259,22 @@ func (e *Exchanger) exchange(ctx context.Context, assertion string) (*Token, err
 	if tr.AccessToken == "" {
 		return nil, fmt.Errorf("tokenexchange: token endpoint returned empty access_token")
 	}
+	if tr.IssuedTokenType != issuedTokenTypeAccessToken {
+		return nil, fmt.Errorf("tokenexchange: token endpoint returned unexpected issued_token_type %q", tr.IssuedTokenType)
+	}
+	if !strings.EqualFold(tr.TokenType, "Bearer") {
+		return nil, fmt.Errorf("tokenexchange: token endpoint returned unexpected token_type %q", tr.TokenType)
+	}
+	if tr.ExpiresIn <= 0 {
+		return nil, fmt.Errorf("tokenexchange: token endpoint returned invalid expires_in %d", tr.ExpiresIn)
+	}
+	if tr.ExpiresIn > maxTokenExpiresInSeconds {
+		return nil, fmt.Errorf("tokenexchange: token endpoint returned expires_in %d exceeding the supported maximum", tr.ExpiresIn)
+	}
 
 	tok := &Token{
 		accessToken: tr.AccessToken,
-		tokenType:   tr.TokenType,
+		tokenType:   "Bearer",
 		expiresAt:   e.clock().Add(time.Duration(tr.ExpiresIn) * time.Second),
 	}
 	if tr.Scope != "" {

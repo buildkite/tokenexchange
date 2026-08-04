@@ -36,4 +36,5 @@ const (
 	grantTypeTokenExchange       = "urn:ietf:params:oauth:grant-type:token-exchange"
 	clientAssertionTypeJWTBearer = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 	subjectTokenTypeUserEmail    = "urn:buildkite:params:oauth:token-type:user-email"
+	issuedTokenTypeAccessToken   = "urn:ietf:params:oauth:token-type:access_token"
 )
