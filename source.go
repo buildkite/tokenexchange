@@ -70,7 +70,8 @@ func NewCachedSource(source Source) *CachedSource {
 }
 
 // NewCachedSourceGrace returns a CachedSource that refreshes its token once it
-// is within grace of expiry. A grace of zero refreshes only after expiry.
+// is within grace of expiry. A grace of zero refreshes only after expiry;
+// negative values are treated as zero.
 func NewCachedSourceGrace(source Source, grace time.Duration) *CachedSource {
 	if grace < 0 {
 		grace = 0

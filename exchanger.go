@@ -80,9 +80,9 @@ type Exchanger struct {
 
 	// now returns the current time; overridable in tests. Defaults to time.Now.
 	now func() time.Time
-	// newJTI generates the JWT ID; overridable in tests. Defaults to a random
-	// 128-bit hex string.
-	newJTI func() (string, error)
+	// randRead fills the JWT ID bytes; overridable in tests. Defaults to
+	// crypto/rand.Read.
+	randRead func([]byte) (int, error)
 }
 
 func (e *Exchanger) endpoint() string {
@@ -174,11 +174,12 @@ func (e *Exchanger) signAssertion() (string, error) {
 }
 
 func (e *Exchanger) generateJTI() (string, error) {
-	if e.newJTI != nil {
-		return e.newJTI()
+	read := rand.Read
+	if e.randRead != nil {
+		read = e.randRead
 	}
 	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
+	if _, err := read(b[:]); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(b[:]), nil

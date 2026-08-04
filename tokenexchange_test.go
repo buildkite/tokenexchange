@@ -89,6 +89,40 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	return len(p), nil
 }
 
+type errorReader struct {
+	err error
+}
+
+func (r *errorReader) Read([]byte) (int, error) {
+	return 0, r.err
+}
+
+type trackingBody struct {
+	closed bool
+}
+
+func (*trackingBody) Read([]byte) (int, error) {
+	return 0, io.EOF
+}
+
+func (b *trackingBody) Close() error {
+	b.closed = true
+	return nil
+}
+
+type signalingContext struct {
+	context.Context
+	entered chan<- struct{}
+}
+
+func (c signalingContext) Done() <-chan struct{} {
+	select {
+	case c.entered <- struct{}{}:
+	default:
+	}
+	return c.Context.Done()
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -211,6 +245,53 @@ func TestExchangerToken(t *testing.T) {
 				t.Errorf("Expiry in %v, want ~1h", d)
 			}
 		})
+	}
+}
+
+func TestExchangerAssertionDefaults(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	ex := newExchanger(testKey(t), "")
+	ex.now = func() time.Time { return now }
+	ex.randRead = func(p []byte) (int, error) {
+		for i := range p {
+			p[i] = 0xab
+		}
+		return len(p), nil
+	}
+
+	assertion, err := ex.signAssertion()
+	if err != nil {
+		t.Fatalf("signAssertion: %v", err)
+	}
+	parsed, err := jwt.Parse(assertion, func(*jwt.Token) (any, error) {
+		return ex.PrivateKey.Public(), nil
+	}, jwt.WithValidMethods([]string{"RS256"}), jwt.WithoutClaimsValidation())
+	if err != nil {
+		t.Fatalf("parsing assertion: %v", err)
+	}
+	claims := parsed.Claims.(jwt.MapClaims)
+	if got := claims["aud"]; got != DefaultEndpoint {
+		t.Errorf("aud = %v, want %q", got, DefaultEndpoint)
+	}
+	if got := claims["iat"]; got != float64(now.Unix()) {
+		t.Errorf("iat = %v, want %d", got, now.Unix())
+	}
+	if got := claims["exp"]; got != float64(now.Add(assertionTTL).Unix()) {
+		t.Errorf("exp = %v, want %d", got, now.Add(assertionTTL).Unix())
+	}
+	if got := claims["jti"]; got != strings.Repeat("ab", 16) {
+		t.Errorf("jti = %v, want deterministic value", got)
+	}
+}
+
+func TestExchangerAssertionRandomError(t *testing.T) {
+	randomErr := errors.New("random source unavailable")
+	ex := newExchanger(testKey(t), "https://token.example.test")
+	ex.randRead = func([]byte) (int, error) { return 0, randomErr }
+
+	_, err := ex.Token(context.Background())
+	if !errors.Is(err, randomErr) || !strings.Contains(err.Error(), "signing assertion: generating jti") {
+		t.Fatalf("Token error = %v, want wrapped random source error", err)
 	}
 }
 
@@ -340,9 +421,53 @@ func TestExchangerRejectsUnsupportedPrivateKeys(t *testing.T) {
 }
 
 func TestValidateRequiredFields(t *testing.T) {
-	_, err := (&Exchanger{OrgSlug: "x", UserEmail: "y", PrivateKey: testKey(t)}).Token(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "ClientID") {
-		t.Fatalf("want ClientID validation error, got %v", err)
+	key := testKey(t)
+	tests := []struct {
+		name  string
+		field string
+		clear func(*Exchanger)
+	}{
+		{name: "ClientID", field: "ClientID", clear: func(ex *Exchanger) { ex.ClientID = "" }},
+		{name: "OrgSlug", field: "OrgSlug", clear: func(ex *Exchanger) { ex.OrgSlug = "" }},
+		{name: "UserEmail", field: "UserEmail", clear: func(ex *Exchanger) { ex.UserEmail = "" }},
+		{name: "PrivateKey", field: "PrivateKey", clear: func(ex *Exchanger) { ex.PrivateKey = nil }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ex := newExchanger(key, "https://token.example.test")
+			tt.clear(ex)
+			if _, err := ex.Token(context.Background()); err == nil || !strings.Contains(err.Error(), tt.field) {
+				t.Fatalf("Token error = %v, want %s validation error", err, tt.field)
+			}
+		})
+	}
+}
+
+func TestTokenErrorFormatting(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *TokenError
+		want string
+	}{
+		{
+			name: "with description",
+			err:  &TokenError{Code: ErrCodeInvalidScope, Description: "scope denied", StatusCode: http.StatusBadRequest},
+			want: "tokenexchange: invalid_scope: scope denied (HTTP 400)",
+		},
+		{
+			name: "without description",
+			err:  &TokenError{Code: ErrCodeInvalidClient, StatusCode: http.StatusUnauthorized},
+			want: "tokenexchange: invalid_client (HTTP 401)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.err.Error(); got != tt.want {
+				t.Errorf("Error() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -400,6 +525,82 @@ func TestTokenResponseBodyLimit(t *testing.T) {
 	}
 }
 
+func TestTokenExchangeFailures(t *testing.T) {
+	key := testKey(t)
+	responseClient := func(status int, body io.ReadCloser) *http.Client {
+		return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: status,
+				Header:     make(http.Header),
+				Body:       body,
+				Request:    req,
+			}, nil
+		})}
+	}
+
+	t.Run("building request", func(t *testing.T) {
+		_, err := newExchanger(key, "://invalid").Token(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "building request") {
+			t.Fatalf("Token error = %v, want building request error", err)
+		}
+	})
+
+	t.Run("performing request", func(t *testing.T) {
+		requestErr := errors.New("request failed")
+		ex := newExchanger(key, "https://token.example.test")
+		ex.HTTPClient = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, requestErr
+		})}
+		if _, err := ex.Token(context.Background()); !errors.Is(err, requestErr) || !strings.Contains(err.Error(), "token request") {
+			t.Fatalf("Token error = %v, want wrapped request error", err)
+		}
+	})
+
+	t.Run("reading response", func(t *testing.T) {
+		readErr := errors.New("response read failed")
+		ex := newExchanger(key, "https://token.example.test")
+		ex.HTTPClient = responseClient(http.StatusOK, io.NopCloser(&errorReader{err: readErr}))
+		if _, err := ex.Token(context.Background()); !errors.Is(err, readErr) || !strings.Contains(err.Error(), "reading token response") {
+			t.Fatalf("Token error = %v, want wrapped response read error", err)
+		}
+	})
+
+	tests := []struct {
+		name    string
+		status  int
+		body    string
+		wantErr string
+	}{
+		{
+			name:    "unexpected response",
+			status:  http.StatusTeapot,
+			body:    "not an OAuth error",
+			wantErr: "unexpected response HTTP 418: not an OAuth error",
+		},
+		{
+			name:    "long unexpected response",
+			status:  http.StatusInternalServerError,
+			body:    strings.Repeat("x", httpBodyPreviewLen+1),
+			wantErr: strings.Repeat("x", httpBodyPreviewLen) + "…",
+		},
+		{
+			name:    "malformed success response",
+			status:  http.StatusOK,
+			body:    "{",
+			wantErr: "parsing token response",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ex := newExchanger(key, "https://token.example.test")
+			ex.HTTPClient = responseClient(tt.status, io.NopCloser(strings.NewReader(tt.body)))
+			if _, err := ex.Token(context.Background()); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Token error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestTokenResponseValidation(t *testing.T) {
 	valid := tokenEndpointResponse{
 		AccessToken:     "bktx_secret",
@@ -407,6 +608,8 @@ func TestTokenResponseValidation(t *testing.T) {
 		TokenType:       "Bearer",
 		ExpiresIn:       3600,
 	}
+	emptyAccessToken := valid
+	emptyAccessToken.AccessToken = ""
 	missingIssuedType := valid
 	missingIssuedType.IssuedTokenType = ""
 	unexpectedIssuedType := valid
@@ -429,6 +632,7 @@ func TestTokenResponseValidation(t *testing.T) {
 		response tokenEndpointResponse
 		wantErr  string
 	}{
+		{name: "empty access token", response: emptyAccessToken, wantErr: "empty access_token"},
 		{name: "missing issued token type", response: missingIssuedType, wantErr: `unexpected issued_token_type ""`},
 		{name: "unexpected issued token type", response: unexpectedIssuedType, wantErr: "unexpected issued_token_type"},
 		{name: "missing token type", response: missingTokenType, wantErr: `unexpected token_type ""`},
@@ -485,12 +689,17 @@ func TestCachedSourceInvalidatesOnlyCurrentToken(t *testing.T) {
 	oldToken := &Token{accessToken: "bktx_old", expiresAt: time.Now().Add(time.Hour)}
 	newToken := &Token{accessToken: "bktx_new", expiresAt: time.Now().Add(time.Hour)}
 	var calls int32
-	src := NewCachedSource(sourceFunc(func(context.Context) (*Token, error) {
+	inner := NewCachedSource(sourceFunc(func(context.Context) (*Token, error) {
 		if atomic.AddInt32(&calls, 1) == 1 {
 			return oldToken, nil
 		}
 		return newToken, nil
 	}))
+	src := NewCachedSource(inner)
+
+	var nilSource *CachedSource
+	nilSource.InvalidateToken(oldToken)
+	src.InvalidateToken(nil)
 
 	if tok, err := src.Token(context.Background()); err != nil || tok != oldToken {
 		t.Fatalf("initial Token = (%v, %v), want old token", tok, err)
@@ -506,6 +715,13 @@ func TestCachedSourceInvalidatesOnlyCurrentToken(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
 		t.Errorf("source called %d times, want 2", got)
+	}
+}
+
+func TestNewCachedSourceGraceTreatsNegativeAsZero(t *testing.T) {
+	src := NewCachedSourceGrace(&staticSource{}, -time.Second)
+	if src.grace != 0 {
+		t.Errorf("grace = %s, want zero", src.grace)
 	}
 }
 
@@ -638,6 +854,31 @@ func TestRefreshRetryBackoff(t *testing.T) {
 		if got := refreshRetryBackoff(tt.failures); got != tt.want {
 			t.Errorf("refreshRetryBackoff(%d) = %s, want %s", tt.failures, got, tt.want)
 		}
+	}
+}
+
+func TestCachedSourceCapsRefreshBackoffAtExpiry(t *testing.T) {
+	now := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
+	oldToken := &Token{accessToken: "bktx_old", expiresAt: now.Add(500 * time.Millisecond)}
+	refreshErr := errors.New("token endpoint unavailable")
+	var calls int32
+	source := sourceFunc(func(context.Context) (*Token, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return oldToken, nil
+		}
+		return nil, refreshErr
+	})
+	src := NewCachedSourceGrace(source, time.Minute)
+	src.now = func() time.Time { return now }
+
+	if _, err := src.Token(context.Background()); err != nil {
+		t.Fatalf("initial Token: %v", err)
+	}
+	if tok, err := src.Token(context.Background()); err != nil || tok != oldToken {
+		t.Fatalf("failed refresh Token = (%v, %v), want old token", tok, err)
+	}
+	if !src.retryAt.Equal(oldToken.expiresAt) {
+		t.Errorf("retryAt = %s, want token expiry %s", src.retryAt, oldToken.expiresAt)
 	}
 }
 
@@ -800,14 +1041,17 @@ func TestCachedSourceRetriesAfterRefreshCallerCanceled(t *testing.T) {
 	}()
 	<-firstRefreshStarted
 
-	secondCtx, cancelSecond := context.WithTimeout(context.Background(), time.Second)
+	secondBaseCtx, cancelSecond := context.WithTimeout(context.Background(), time.Second)
 	defer cancelSecond()
+	secondEntered := make(chan struct{}, 1)
+	secondCtx := signalingContext{Context: secondBaseCtx, entered: secondEntered}
 	secondResult := make(chan tokenResult, 1)
 	go func() {
 		tok, err := src.Token(secondCtx)
 		secondResult <- tokenResult{token: tok, err: err}
 	}()
 
+	<-secondEntered
 	cancelFirst()
 	if result := <-firstResult; !errors.Is(result.err, context.Canceled) {
 		t.Fatalf("first Token error = %v, want context.Canceled", result.err)
@@ -841,11 +1085,16 @@ func TestCachedSourceSharesRefreshResult(t *testing.T) {
 	}()
 	<-refreshStarted
 
+	secondBaseCtx, cancelSecond := context.WithTimeout(context.Background(), time.Second)
+	defer cancelSecond()
+	secondEntered := make(chan struct{}, 1)
+	secondCtx := signalingContext{Context: secondBaseCtx, entered: secondEntered}
 	secondResult := make(chan tokenResult, 1)
 	go func() {
-		got, err := src.Token(context.Background())
+		got, err := src.Token(secondCtx)
 		secondResult <- tokenResult{token: got, err: err}
 	}()
+	<-secondEntered
 	close(releaseRefresh)
 
 	for i, resultCh := range []<-chan tokenResult{firstResult, secondResult} {
@@ -924,6 +1173,49 @@ func TestTransportInjectsBearer(t *testing.T) {
 
 	if gotAuth != "Bearer bktx_secret" {
 		t.Errorf("Authorization = %q", gotAuth)
+	}
+}
+
+func TestTransportAuthenticationErrorsCloseRequestBody(t *testing.T) {
+	sourceErr := errors.New("source failed")
+	tests := []struct {
+		name    string
+		source  Source
+		wantErr string
+	}{
+		{name: "nil source", wantErr: "Transport.Source is nil"},
+		{
+			name: "source error",
+			source: sourceFunc(func(context.Context) (*Token, error) {
+				return nil, sourceErr
+			}),
+			wantErr: "obtaining token: source failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := &trackingBody{}
+			req, err := http.NewRequest(http.MethodPost, "https://api.example.com/v2/jobs", body)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			transport := &Transport{
+				Source:         tt.source,
+				AllowedOrigins: []string{"https://api.example.com"},
+				Base: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					t.Fatal("base transport should not be called")
+					return nil, nil
+				}),
+			}
+
+			if _, err := transport.RoundTrip(req); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("RoundTrip error = %v, want containing %q", err, tt.wantErr)
+			}
+			if !body.closed {
+				t.Error("request body was not closed")
+			}
+		})
 	}
 }
 
