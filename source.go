@@ -25,6 +25,13 @@ type Source interface {
 	Token(ctx context.Context) (*Token, error)
 }
 
+// InvalidatingSource is a Source that can discard a token rejected by an API.
+// Implementations must ignore a stale token if a newer token is already current.
+type InvalidatingSource interface {
+	Source
+	InvalidateToken(token *Token)
+}
+
 type refreshCall struct {
 	done         chan struct{}
 	token        *Token
@@ -69,6 +76,30 @@ func NewCachedSourceGrace(source Source, grace time.Duration) *CachedSource {
 		grace = 0
 	}
 	return &CachedSource{source: source, grace: grace}
+}
+
+// InvalidateToken implements [InvalidatingSource]. It removes token from the
+// cache if it is still current; a stale token does not invalidate a newer one.
+// It is safe for concurrent use.
+func (c *CachedSource) InvalidateToken(tok *Token) {
+	if c == nil || tok == nil {
+		return
+	}
+
+	c.mu.Lock()
+	if c.current != tok {
+		c.mu.Unlock()
+		return
+	}
+	c.current = nil
+	c.retryAt = time.Time{}
+	c.refreshFailures = 0
+	source := c.source
+	c.mu.Unlock()
+
+	if invalidator, ok := source.(InvalidatingSource); ok {
+		invalidator.InvalidateToken(tok)
+	}
 }
 
 // Token returns the cached token if it is still valid, otherwise it mints and

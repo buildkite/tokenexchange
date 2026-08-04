@@ -63,7 +63,9 @@ func (t *Transport) allowsOrigin(req *http.Request) bool {
 // request's context, then attaches it as a Bearer credential on a clone of the
 // request so the caller's original is never mutated. Requests outside
 // [Transport.AllowedOrigins] are delegated without obtaining or attaching a
-// token.
+// token. If an authenticated request returns HTTP 401 and the Source implements
+// [InvalidatingSource], RoundTrip invalidates that token but does not retry the
+// request.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if !t.allowsOrigin(req) {
 		return t.base().RoundTrip(req)
@@ -85,7 +87,13 @@ func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	// Per the http.RoundTripper contract, the request body must be closed,
 	// including on error paths. Once delegated, the base RoundTripper owns it.
-	return t.base().RoundTrip(r)
+	resp, err := t.base().RoundTrip(r)
+	if resp != nil && resp.StatusCode == http.StatusUnauthorized {
+		if invalidator, ok := t.Source.(InvalidatingSource); ok {
+			invalidator.InvalidateToken(tok)
+		}
+	}
+	return resp, err
 }
 
 func closeRequestBody(req *http.Request) {

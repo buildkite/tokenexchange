@@ -119,8 +119,8 @@ This is a valid configuration, not an error — so the library does not reject i
 ```go
 src := tokenexchange.NewCachedSource(ex)
 src.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
-// WARN tokenexchange: minted token lifetime is shorter than the cache refresh
-// grace; caching is ineffective ... token_lifetime=30s refresh_grace=1m0s
+// WARN tokenexchange: minted token lifetime does not exceed the cache refresh
+// grace; caching is ineffective for sequential lookups ...
 ```
 
 Use a longer token TTL, or a smaller grace via `NewCachedSourceGrace`.
@@ -135,6 +135,10 @@ Concurrent refreshes are coalesced. While a proactive refresh is in progress,
 other callers immediately receive the unexpired cached token. Callers waiting
 for an initial mint or an expired-token refresh can cancel their own context
 without canceling or waiting for the in-flight refresh.
+
+When used with `CachedSource`, a `401 Unauthorized` response causes `Transport`
+to invalidate that token so the next request refreshes it. The failed request
+is not retried automatically, avoiding unsafe replay of its body.
 
 ## Examples
 

@@ -304,6 +304,34 @@ func TestCachedSourceReusesToken(t *testing.T) {
 	}
 }
 
+func TestCachedSourceInvalidatesOnlyCurrentToken(t *testing.T) {
+	oldToken := &Token{accessToken: "bktx_old", expiresAt: time.Now().Add(time.Hour)}
+	newToken := &Token{accessToken: "bktx_new", expiresAt: time.Now().Add(time.Hour)}
+	var calls int32
+	src := NewCachedSource(sourceFunc(func(context.Context) (*Token, error) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			return oldToken, nil
+		}
+		return newToken, nil
+	}))
+
+	if tok, err := src.Token(context.Background()); err != nil || tok != oldToken {
+		t.Fatalf("initial Token = (%v, %v), want old token", tok, err)
+	}
+	src.InvalidateToken(oldToken)
+	if tok, err := src.Token(context.Background()); err != nil || tok != newToken {
+		t.Fatalf("Token after invalidation = (%v, %v), want new token", tok, err)
+	}
+
+	src.InvalidateToken(oldToken)
+	if tok, err := src.Token(context.Background()); err != nil || tok != newToken {
+		t.Fatalf("Token after stale invalidation = (%v, %v), want new token", tok, err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("source called %d times, want 2", got)
+	}
+}
+
 func TestCachedSourceRefreshesWithinGrace(t *testing.T) {
 	key := testKey(t)
 	// 30s TTL with a 60s grace window => always considered stale => refetch.
@@ -719,6 +747,62 @@ func TestTransportInjectsBearer(t *testing.T) {
 
 	if gotAuth != "Bearer bktx_secret" {
 		t.Errorf("Authorization = %q", gotAuth)
+	}
+}
+
+func TestTransportInvalidatesCachedTokenAfterUnauthorized(t *testing.T) {
+	oldToken := &Token{accessToken: "bktx_old", expiresAt: time.Now().Add(time.Hour)}
+	newToken := &Token{accessToken: "bktx_new", expiresAt: time.Now().Add(time.Hour)}
+	var sourceCalls int32
+	source := NewCachedSource(sourceFunc(func(context.Context) (*Token, error) {
+		if atomic.AddInt32(&sourceCalls, 1) == 1 {
+			return oldToken, nil
+		}
+		return newToken, nil
+	}))
+
+	var requestCalls int32
+	var gotAuth []string
+	transport := &Transport{
+		Source:         source,
+		AllowedOrigins: []string{"https://api.example.com"},
+		Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			gotAuth = append(gotAuth, req.Header.Get("Authorization"))
+			status := http.StatusOK
+			if atomic.AddInt32(&requestCalls, 1) == 1 {
+				status = http.StatusUnauthorized
+			}
+			return &http.Response{
+				StatusCode: status,
+				Body:       io.NopCloser(strings.NewReader("")),
+				Request:    req,
+			}, nil
+		}),
+	}
+
+	for i, wantStatus := range []int{http.StatusUnauthorized, http.StatusOK} {
+		req, err := http.NewRequest(http.MethodGet, "https://api.example.com/v2/user", nil)
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatalf("RoundTrip %d: %v", i+1, err)
+		}
+		_ = resp.Body.Close()
+		if resp.StatusCode != wantStatus {
+			t.Errorf("response %d status = %d, want %d", i+1, resp.StatusCode, wantStatus)
+		}
+		if i == 0 && atomic.LoadInt32(&requestCalls) != 1 {
+			t.Fatal("unauthorized request was retried")
+		}
+	}
+
+	if got := strings.Join(gotAuth, ","); got != "Bearer bktx_old,Bearer bktx_new" {
+		t.Errorf("Authorization headers = %q", got)
+	}
+	if got := atomic.LoadInt32(&sourceCalls); got != 2 {
+		t.Errorf("source called %d times, want 2", got)
 	}
 }
 
