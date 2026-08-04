@@ -2,9 +2,9 @@
 // github.com/buildkite/tokenexchange library.
 //
 // It builds a cached token source from a signed JWT assertion, then makes one
-// or more authenticated Buildkite REST API requests. The same *http.Client
-// works for the GraphQL API, Package Registries, or any raw HTTP call — and can
-// be handed to go-buildkite via buildkite.WithHTTPClient.
+// or more authenticated Buildkite REST API requests. The library also supports
+// the GraphQL API, Package Registries, and explicitly allowed custom origins,
+// and its client can be handed to go-buildkite via buildkite.WithHTTPClient.
 //
 // Usage:
 //
@@ -86,8 +86,13 @@ func main() {
 	log.Printf("[oauth] minted token (scopes=%s, expires in %s)",
 		strings.Join(tok.Scopes(), " "), time.Until(tok.Expiry()).Round(time.Second))
 
-	// One authenticated client, usable for REST/GraphQL/registries/raw HTTP.
-	client := tokenexchange.NewClient(source)
+	apiBaseURL, err := url.Parse(*apiBase)
+	if err != nil || apiBaseURL.Scheme == "" || apiBaseURL.Host == "" {
+		log.Fatalf("invalid API base URL %q", *apiBase)
+	}
+
+	// One authenticated client, scoped to the configured REST API origin.
+	client := tokenexchange.NewClient(source, apiBaseURL.Scheme+"://"+apiBaseURL.Host)
 	client.Timeout = 30 * time.Second
 
 	paths := flag.Args()

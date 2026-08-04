@@ -11,7 +11,7 @@
 // an [*http.Client] ([NewClient]) that inject the minted token as a Bearer
 // credential. That client can drive the REST API (for example via
 // github.com/buildkite/go-buildkite's WithHTTPClient option), the GraphQL API,
-// Package Registries, or any raw HTTP call:
+// Package Registries, or raw HTTP calls to explicitly allowed origins:
 //
 //	signer, _ := tokenexchange.LoadPrivateKey("private_key.pem")
 //
@@ -25,8 +25,8 @@
 //	}
 //
 //	httpClient := tokenexchange.NewClient(tokenexchange.NewCachedSource(ex))
-//	// httpClient now authenticates every request with a freshly-minted,
-//	// transparently-cached bktx_ token.
+//	// httpClient now authenticates requests to the official Buildkite API
+//	// origins with a freshly-minted, transparently-cached bktx_ token.
 package tokenexchange
 
 const (

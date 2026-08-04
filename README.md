@@ -1,10 +1,10 @@
 # tokenexchange
 
-A small, dependency-light Go library for [Buildkite OAuth Token Exchange][docs] (RFC 8693). It signs a JWT assertion (RFC 7523) with your application's private key, exchanges it at the Buildkite token endpoint for a short-lived, scoped API token (prefixed `bktx_`), and hands you an `*http.Client` that authenticates every request on behalf of a user.
+A small, dependency-light Go library for [Buildkite OAuth Token Exchange][docs] (RFC 8693). It signs a JWT assertion (RFC 7523) with your application's private key, exchanges it at the Buildkite token endpoint for a short-lived, scoped API token (prefixed `bktx_`), and hands you an `*http.Client` that authenticates requests to allowed Buildkite API origins on behalf of a user.
 
 The package is intentionally **independent of any Buildkite API client**. Its integration currency is an `http.RoundTripper` (`Transport`) and an `*http.Client` (`NewClient`). That means you can use it:
 
-- standalone against the **GraphQL API**, **Package Registries**, or any raw HTTP call, and
+- standalone against the **GraphQL API**, **Package Registries**, or raw HTTP calls to allowed origins, and
 - with official packages, such as [`go-buildkite`][go-buildkite] via its `WithHTTPClient` option, for the  REST API, without forcing a dependency on `go-buildkite` (or on this library) in either direction
 
 ## Install
@@ -61,7 +61,7 @@ ex := &tokenexchange.Exchanger{
 // as recommended by the Buildkite docs. Safe for concurrent use.
 src := tokenexchange.NewCachedSource(ex)
 
-// An *http.Client that authenticates every request.
+// An *http.Client scoped to the official Buildkite API origins.
 httpClient := tokenexchange.NewClient(src)
 ```
 
@@ -85,6 +85,30 @@ req.Header.Set("Content-Type", "application/json")
 
 resp, err := httpClient.Do(req) // Authorization: Bearer bktx_... added automatically
 ```
+
+### Destination scoping
+
+To prevent credentials leaking through client reuse or cross-origin redirects,
+`Transport` only attaches tokens to these HTTPS origins by default:
+
+- `https://api.buildkite.com`
+- `https://graphql.buildkite.com`
+- `https://packages.buildkite.com`
+
+Requests to any other origin are still sent, but without obtaining or attaching
+a token. This allows redirects to presigned storage URLs to work without
+forwarding the Buildkite credential.
+
+For a custom API origin, pass it to `NewClient`. Supplying one or more origins
+replaces the defaults:
+
+```go
+httpClient := tokenexchange.NewClient(src, "https://buildkite.example.com")
+```
+
+Origins must have the form `scheme://host`, including a port when required.
+When constructing `Transport` directly, configure the equivalent
+`AllowedOrigins` field.
 
 ## Caching and short token TTLs
 
@@ -122,8 +146,8 @@ go run ./examples/mint \
 | `Exchanger` | Signs the JWT assertion and performs the exchange. Implements `Source`. |
 | `Source` | `Token(ctx) (*Token, error)` — anything that supplies tokens. |
 | `CachedSource` | Caches a token and refreshes within a grace window. Concurrency-safe. Optional `Logger` warns on cache-thrash. |
-| `Transport` | `http.RoundTripper` that injects `Authorization: Bearer`. |
-| `NewClient(Source)` | Convenience `*http.Client` built from a `Transport`. |
+| `Transport` | Origin-scoped `http.RoundTripper` that injects `Authorization: Bearer`. |
+| `NewClient(Source, ...allowedOrigins)` | Convenience `*http.Client` built from a `Transport`; defaults to official Buildkite API origins. |
 | `LoadPrivateKey` / `ParsePrivateKey` | Parse PKCS#1, PKCS#8, or SEC1 EC PEM keys. |
 | `TokenError` | Typed RFC 6749 §5.2 error (`Code`, `Description`, `StatusCode`). |
 
