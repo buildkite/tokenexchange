@@ -3,15 +3,25 @@ package tokenexchange
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -27,6 +37,24 @@ func testKey(t *testing.T) *rsa.PrivateKey {
 		t.Fatalf("generating key: %v", err)
 	}
 	return key
+}
+
+func testECKey(t *testing.T, curve elliptic.Curve) *ecdsa.PrivateKey {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		t.Fatalf("generating EC key: %v", err)
+	}
+	return key
+}
+
+func privateKeyPKCS8PEM(t *testing.T, key any) []byte {
+	t.Helper()
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatalf("marshaling PKCS#8 private key: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
 }
 
 type staticSource struct {
@@ -69,8 +97,18 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // fakeEndpoint returns an httptest.Server that validates the exchange request
 // and the signed assertion, then responds with a token.
-func fakeEndpoint(t *testing.T, key *rsa.PrivateKey, expiresIn int) (*httptest.Server, *int32) {
+func fakeEndpoint(t *testing.T, key crypto.Signer, expiresIn int) (*httptest.Server, *int32) {
 	t.Helper()
+	var algorithm string
+	switch key.(type) {
+	case *rsa.PrivateKey:
+		algorithm = "RS256"
+	case *ecdsa.PrivateKey:
+		algorithm = "ES256"
+	default:
+		t.Fatalf("unsupported test key type %T", key)
+	}
+
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&calls, 1)
@@ -96,11 +134,14 @@ func fakeEndpoint(t *testing.T, key *rsa.PrivateKey, expiresIn int) (*httptest.S
 
 		// Verify the client assertion signature and claims.
 		tok, err := jwt.Parse(form.Get("client_assertion"), func(*jwt.Token) (any, error) {
-			return &key.PublicKey, nil
-		}, jwt.WithValidMethods([]string{"RS256"}))
+			return key.Public(), nil
+		}, jwt.WithValidMethods([]string{algorithm}))
 		if err != nil {
 			t.Errorf("parsing assertion: %v", err)
 		} else {
+			if got := tok.Method.Alg(); got != algorithm {
+				t.Errorf("signing algorithm = %q, want %q", got, algorithm)
+			}
 			claims := tok.Claims.(jwt.MapClaims)
 			if claims["iss"] != "client-id" || claims["sub"] != "client-id" {
 				t.Errorf("iss/sub = %v/%v", claims["iss"], claims["sub"])
@@ -108,9 +149,9 @@ func fakeEndpoint(t *testing.T, key *rsa.PrivateKey, expiresIn int) (*httptest.S
 			if claims["jti"] == nil || claims["jti"] == "" {
 				t.Errorf("missing jti")
 			}
-		}
-		if kid := tok.Header["kid"]; kid != "key-1" {
-			t.Errorf("kid header = %v", kid)
+			if kid := tok.Header["kid"]; kid != "key-1" {
+				t.Errorf("kid header = %v", kid)
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
@@ -128,7 +169,7 @@ func fakeEndpoint(t *testing.T, key *rsa.PrivateKey, expiresIn int) (*httptest.S
 	return srv, &calls
 }
 
-func newExchanger(key *rsa.PrivateKey, endpoint string) *Exchanger {
+func newExchanger(key crypto.Signer, endpoint string) *Exchanger {
 	return &Exchanger{
 		ClientID:   "client-id",
 		OrgSlug:    "my-org",
@@ -141,24 +182,160 @@ func newExchanger(key *rsa.PrivateKey, endpoint string) *Exchanger {
 }
 
 func TestExchangerToken(t *testing.T) {
-	key := testKey(t)
-	srv, _ := fakeEndpoint(t, key, 3600)
+	tests := []struct {
+		name string
+		key  crypto.Signer
+	}{
+		{name: "RS256", key: testKey(t)},
+		{name: "ES256", key: testECKey(t, elliptic.P256())},
+	}
 
-	tok, err := newExchanger(key, srv.URL).Token(context.Background())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv, _ := fakeEndpoint(t, tt.key, 3600)
+
+			tok, err := newExchanger(tt.key, srv.URL).Token(context.Background())
+			if err != nil {
+				t.Fatalf("Token: %v", err)
+			}
+			if tok.AccessToken() != "bktx_secret" {
+				t.Errorf("AccessToken = %q", tok.AccessToken())
+			}
+			if tok.Type() != "Bearer" {
+				t.Errorf("Type = %q", tok.Type())
+			}
+			if got := strings.Join(tok.Scopes(), " "); got != "read_pipelines read_builds" {
+				t.Errorf("Scopes = %q", got)
+			}
+			if d := time.Until(tok.Expiry()); d < 50*time.Minute || d > time.Hour {
+				t.Errorf("Expiry in %v, want ~1h", d)
+			}
+		})
+	}
+}
+
+func TestParsePrivateKey(t *testing.T) {
+	rsaKey := testKey(t)
+	ecKey := testECKey(t, elliptic.P256())
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
-		t.Fatalf("Token: %v", err)
+		t.Fatalf("generating Ed25519 key: %v", err)
 	}
-	if tok.AccessToken() != "bktx_secret" {
-		t.Errorf("AccessToken = %q", tok.AccessToken())
+	ecDER, err := x509.MarshalECPrivateKey(ecKey)
+	if err != nil {
+		t.Fatalf("marshaling SEC 1 private key: %v", err)
 	}
-	if tok.Type() != "Bearer" {
-		t.Errorf("Type = %q", tok.Type())
+
+	tests := []struct {
+		name   string
+		pem    []byte
+		signer crypto.Signer
+	}{
+		{
+			name:   "RSA PKCS#1",
+			pem:    pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rsaKey)}),
+			signer: rsaKey,
+		},
+		{name: "RSA PKCS#8", pem: privateKeyPKCS8PEM(t, rsaKey), signer: rsaKey},
+		{
+			name:   "ECDSA SEC 1",
+			pem:    pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: ecDER}),
+			signer: ecKey,
+		},
+		{name: "ECDSA PKCS#8", pem: privateKeyPKCS8PEM(t, ecKey), signer: ecKey},
+		{name: "Ed25519 PKCS#8", pem: privateKeyPKCS8PEM(t, edKey), signer: edKey},
 	}
-	if got := strings.Join(tok.Scopes(), " "); got != "read_pipelines read_builds" {
-		t.Errorf("Scopes = %q", got)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParsePrivateKey(tt.pem)
+			if err != nil {
+				t.Fatalf("ParsePrivateKey: %v", err)
+			}
+			if reflect.TypeOf(got) != reflect.TypeOf(tt.signer) {
+				t.Errorf("signer type = %T, want %T", got, tt.signer)
+			}
+			if !reflect.DeepEqual(got.Public(), tt.signer.Public()) {
+				t.Errorf("public key does not match original")
+			}
+		})
 	}
-	if d := time.Until(tok.Expiry()); d < 50*time.Minute || d > time.Hour {
-		t.Errorf("Expiry in %v, want ~1h", d)
+}
+
+func TestLoadPrivateKey(t *testing.T) {
+	key := testKey(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "private.pem")
+	if err := os.WriteFile(path, privateKeyPKCS8PEM(t, key), 0o600); err != nil {
+		t.Fatalf("writing private key: %v", err)
+	}
+
+	got, err := LoadPrivateKey(path)
+	if err != nil {
+		t.Fatalf("LoadPrivateKey: %v", err)
+	}
+	if !reflect.DeepEqual(got.Public(), key.Public()) {
+		t.Errorf("public key does not match original")
+	}
+
+	if _, err := LoadPrivateKey(filepath.Join(dir, "missing.pem")); err == nil || !strings.Contains(err.Error(), "reading private key") {
+		t.Fatalf("missing file error = %v, want reading private key error", err)
+	}
+}
+
+func TestParsePrivateKeyErrors(t *testing.T) {
+	x25519Key, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating X25519 key: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		pem     []byte
+		wantErr string
+	}{
+		{name: "no PEM block", pem: []byte("not PEM"), wantErr: "no PEM block found"},
+		{
+			name:    "invalid DER",
+			pem:     pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("invalid")}),
+			wantErr: "unable to parse private key",
+		},
+		{
+			name:    "PKCS#8 non-signer",
+			pem:     privateKeyPKCS8PEM(t, x25519Key),
+			wantErr: "does not implement crypto.Signer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ParsePrivateKey(tt.pem); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("ParsePrivateKey error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestExchangerRejectsUnsupportedPrivateKeys(t *testing.T) {
+	_, edKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating Ed25519 key: %v", err)
+	}
+	tests := []struct {
+		name    string
+		key     crypto.Signer
+		wantErr string
+	}{
+		{name: "ECDSA P-384", key: testECKey(t, elliptic.P384()), wantErr: "only P-256 ECDSA keys are supported"},
+		{name: "Ed25519", key: edKey, wantErr: "unsupported key type"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := newExchanger(tt.key, "https://token.example.test").Token(context.Background()); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Token error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 
