@@ -68,7 +68,8 @@ type Exchanger struct {
 	Scopes []string
 
 	// ExpiresIn optionally requests a token TTL, capped by the application's
-	// maximum. If zero, the application's maximum TTL is used.
+	// maximum. If zero, the application's maximum TTL is used. Positive values
+	// must be at least one second and are rounded down to whole seconds.
 	ExpiresIn time.Duration
 
 	// Endpoint is the token endpoint URL. Defaults to [DefaultEndpoint]. It is
@@ -116,6 +117,10 @@ func (e *Exchanger) validate() error {
 		return fmt.Errorf("tokenexchange: UserEmail is required")
 	case e.PrivateKey == nil:
 		return fmt.Errorf("tokenexchange: PrivateKey is required")
+	case e.ExpiresIn < 0:
+		return fmt.Errorf("tokenexchange: ExpiresIn must not be negative")
+	case e.ExpiresIn > 0 && e.ExpiresIn < time.Second:
+		return fmt.Errorf("tokenexchange: ExpiresIn must be at least 1s when set")
 	}
 	return nil
 }
@@ -211,7 +216,7 @@ func (e *Exchanger) exchange(ctx context.Context, assertion string) (*Token, err
 		params.Set("scope", strings.Join(e.Scopes, " "))
 	}
 	if e.ExpiresIn > 0 {
-		params.Set("expires_in", fmt.Sprintf("%d", int(e.ExpiresIn.Seconds())))
+		params.Set("expires_in", fmt.Sprintf("%d", e.ExpiresIn/time.Second))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint(), strings.NewReader(params.Encode()))

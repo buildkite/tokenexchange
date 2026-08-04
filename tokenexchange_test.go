@@ -444,6 +444,28 @@ func TestValidateRequiredFields(t *testing.T) {
 	}
 }
 
+func TestValidateExpiresIn(t *testing.T) {
+	key := testKey(t)
+	tests := []struct {
+		name      string
+		expiresIn time.Duration
+		wantErr   string
+	}{
+		{name: "negative", expiresIn: -time.Second, wantErr: "ExpiresIn must not be negative"},
+		{name: "sub-second", expiresIn: 500 * time.Millisecond, wantErr: "ExpiresIn must be at least 1s"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ex := newExchanger(key, "https://token.example.test")
+			ex.ExpiresIn = tt.expiresIn
+			if _, err := ex.Token(context.Background()); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Token error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestTokenErrorFormatting(t *testing.T) {
 	tests := []struct {
 		name string
@@ -1413,11 +1435,11 @@ func TestExpiresInParameter(t *testing.T) {
 	defer srv.Close()
 
 	ex := newExchanger(key, srv.URL)
-	ex.ExpiresIn = 10 * time.Minute
+	ex.ExpiresIn = 1500 * time.Millisecond
 	if _, err := ex.Token(context.Background()); err != nil {
 		t.Fatalf("Token: %v", err)
 	}
-	if gotExpiresIn != "600" {
-		t.Errorf("expires_in = %q, want 600", gotExpiresIn)
+	if gotExpiresIn != "1" {
+		t.Errorf("expires_in = %q, want 1", gotExpiresIn)
 	}
 }
