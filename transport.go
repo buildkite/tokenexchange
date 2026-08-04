@@ -3,10 +3,11 @@ package tokenexchange
 import (
 	"fmt"
 	"net/http"
+	"strings"
 )
 
-// Transport is an [http.RoundTripper] that authenticates every outgoing request
-// with a token obtained from Source.
+// Transport is an [http.RoundTripper] that authenticates outgoing requests to
+// allowed origins with a token obtained from Source.
 //
 // It is the primary integration point with API clients: pass a client built
 // from a Transport to anything that accepts an [*http.Client]. For example,
@@ -19,6 +20,13 @@ type Transport struct {
 
 	// Base is the underlying RoundTripper. Defaults to http.DefaultTransport.
 	Base http.RoundTripper
+
+	// AllowedOrigins limits where tokens are attached. Each entry must be an
+	// origin of the form "scheme://host", including a port when required. If
+	// empty, the official Buildkite REST, GraphQL, and Package Registries HTTPS
+	// origins are allowed. Requests to other origins, including cross-origin
+	// redirects, are sent through Base without a token.
+	AllowedOrigins []string
 }
 
 func (t *Transport) base() http.RoundTripper {
@@ -28,10 +36,39 @@ func (t *Transport) base() http.RoundTripper {
 	return http.DefaultTransport
 }
 
+func (t *Transport) allowsOrigin(req *http.Request) bool {
+	origin := req.URL.Scheme + "://" + req.URL.Host
+	if len(t.AllowedOrigins) == 0 {
+		switch {
+		case strings.EqualFold(origin, "https://api.buildkite.com"):
+			return true
+		case strings.EqualFold(origin, "https://graphql.buildkite.com"):
+			return true
+		case strings.EqualFold(origin, "https://packages.buildkite.com"):
+			return true
+		default:
+			return false
+		}
+	}
+
+	for _, allowed := range t.AllowedOrigins {
+		if strings.EqualFold(origin, allowed) {
+			return true
+		}
+	}
+	return false
+}
+
 // RoundTrip implements [http.RoundTripper]. It fetches a token using the
 // request's context, then attaches it as a Bearer credential on a clone of the
-// request so the caller's original is never mutated.
+// request so the caller's original is never mutated. Requests outside
+// [Transport.AllowedOrigins] are delegated without obtaining or attaching a
+// token.
 func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if !t.allowsOrigin(req) {
+		return t.base().RoundTrip(req)
+	}
+
 	if t.Source == nil {
 		closeRequestBody(req)
 		return nil, fmt.Errorf("tokenexchange: Transport.Source is nil")
@@ -57,14 +94,20 @@ func closeRequestBody(req *http.Request) {
 	}
 }
 
-// NewClient returns an [*http.Client] that authenticates every request with
-// tokens from source. It is a convenience wrapper around [Transport].
+// NewClient returns an [*http.Client] that authenticates requests to allowed
+// origins with tokens from source. It is a convenience wrapper around
+// [Transport]. If allowedOrigins is empty, the official Buildkite REST,
+// GraphQL, and Package Registries HTTPS origins are allowed. Supplying origins
+// replaces those defaults.
 //
 // Pass the result to any API client that accepts an *http.Client:
 //
 //	bk, _ := buildkite.NewOpts(buildkite.WithHTTPClient(
 //		tokenexchange.NewClient(tokenexchange.NewCachedSource(ex)),
 //	))
-func NewClient(source Source) *http.Client {
-	return &http.Client{Transport: &Transport{Source: source}}
+func NewClient(source Source, allowedOrigins ...string) *http.Client {
+	return &http.Client{Transport: &Transport{
+		Source:         source,
+		AllowedOrigins: allowedOrigins,
+	}}
 }

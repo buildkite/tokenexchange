@@ -29,6 +29,21 @@ func testKey(t *testing.T) *rsa.PrivateKey {
 	return key
 }
 
+type staticSource struct {
+	calls int32
+}
+
+func (s *staticSource) Token(context.Context) (*Token, error) {
+	atomic.AddInt32(&s.calls, 1)
+	return &Token{accessToken: "bktx_secret", tokenType: "Bearer"}, nil
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
 // fakeEndpoint returns an httptest.Server that validates the exchange request
 // and the signed assertion, then responds with a token.
 func fakeEndpoint(t *testing.T, key *rsa.PrivateKey, expiresIn int) (*httptest.Server, *int32) {
@@ -256,7 +271,7 @@ func TestTransportInjectsBearer(t *testing.T) {
 	}))
 	defer apiSrv.Close()
 
-	client := NewClient(NewCachedSource(newExchanger(key, exSrv.URL)))
+	client := NewClient(NewCachedSource(newExchanger(key, exSrv.URL)), apiSrv.URL)
 	resp, err := client.Get(apiSrv.URL)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
@@ -265,6 +280,125 @@ func TestTransportInjectsBearer(t *testing.T) {
 
 	if gotAuth != "Bearer bktx_secret" {
 		t.Errorf("Authorization = %q", gotAuth)
+	}
+}
+
+func TestTransportScopesBearerToAllowedOrigins(t *testing.T) {
+	tests := []struct {
+		name           string
+		url            string
+		allowedOrigins []string
+		wantAuth       string
+		wantCalls      int32
+	}{
+		{
+			name:      "REST API",
+			url:       "https://api.buildkite.com/v2/user",
+			wantAuth:  "Bearer bktx_secret",
+			wantCalls: 1,
+		},
+		{
+			name:      "GraphQL API",
+			url:       "https://graphql.buildkite.com/v1",
+			wantAuth:  "Bearer bktx_secret",
+			wantCalls: 1,
+		},
+		{
+			name:      "Package Registries",
+			url:       "https://packages.buildkite.com/my-org/my-registry/files/file-1.0.0.tgz",
+			wantAuth:  "Bearer bktx_secret",
+			wantCalls: 1,
+		},
+		{
+			name: "HTTP downgrade",
+			url:  "http://api.buildkite.com/v2/user",
+		},
+		{
+			name: "unrelated origin",
+			url:  "https://example.com",
+		},
+		{
+			name:           "custom origin",
+			url:            "https://buildkite.example.com/v2/user",
+			allowedOrigins: []string{"https://buildkite.example.com"},
+			wantAuth:       "Bearer bktx_secret",
+			wantCalls:      1,
+		},
+		{
+			name:           "custom origins replace defaults",
+			url:            "https://api.buildkite.com/v2/user",
+			allowedOrigins: []string{"https://buildkite.example.com"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			source := &staticSource{}
+			var gotAuth string
+			transport := &Transport{
+				Source:         source,
+				AllowedOrigins: tt.allowedOrigins,
+				Base: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					gotAuth = req.Header.Get("Authorization")
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Body:       io.NopCloser(strings.NewReader("")),
+						Request:    req,
+					}, nil
+				}),
+			}
+
+			req, err := http.NewRequest(http.MethodGet, tt.url, nil)
+			if err != nil {
+				t.Fatalf("NewRequest: %v", err)
+			}
+			resp, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("RoundTrip: %v", err)
+			}
+			_ = resp.Body.Close()
+
+			if gotAuth != tt.wantAuth {
+				t.Errorf("Authorization = %q, want %q", gotAuth, tt.wantAuth)
+			}
+			if got := atomic.LoadInt32(&source.calls); got != tt.wantCalls {
+				t.Errorf("source called %d times, want %d", got, tt.wantCalls)
+			}
+		})
+	}
+}
+
+func TestTransportDoesNotAuthenticateCrossOriginRedirect(t *testing.T) {
+	source := &staticSource{}
+	var redirectedAuth string
+	redirected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectedAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer redirected.Close()
+
+	var originAuth string
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originAuth = r.Header.Get("Authorization")
+		http.Redirect(w, r, redirected.URL, http.StatusFound)
+	}))
+	defer origin.Close()
+
+	client := NewClient(source, origin.URL)
+	resp, err := client.Get(origin.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if originAuth != "Bearer bktx_secret" {
+		t.Errorf("origin Authorization = %q", originAuth)
+	}
+	if redirectedAuth != "" {
+		t.Errorf("redirected Authorization = %q, want no credential", redirectedAuth)
+	}
+	if got := atomic.LoadInt32(&source.calls); got != 1 {
+		t.Errorf("source called %d times, want 1", got)
 	}
 }
 
