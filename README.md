@@ -7,7 +7,7 @@ It works with plain `net/http` and does not depend on a Buildkite API client.
 ## Install
 
 ```bash
-go get github.com/buildkite/tokenexchange
+go get github.com/buildkite/tokenexchange@v0.1.0
 ```
 
 ## Before you start
