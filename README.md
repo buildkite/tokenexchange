@@ -100,6 +100,7 @@ if errors.As(err, &te) && te.Code == tokenexchange.ErrCodeInvalidScope {
 
 - [`examples/jwks`](examples/jwks) converts a PEM key into a JWKS
 - [`examples/mint`](examples/mint) performs an exchange and makes an authenticated REST request
+- [`examples/mcp_gateway`](examples/mcp_gateway) runs a single-user MCP gateway with demo authentication
 
 [docs]: https://buildkite.com/docs/apis/oauth-token-exchange
 [go-buildkite]: https://github.com/buildkite/go-buildkite
