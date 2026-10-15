@@ -1,13 +1,14 @@
 steps:
   - label: ":go: Verify Go {{matrix}}"
     matrix:
-      - "1.25"
-      - "1.26"
+      - "1.26.9"
+      - "1.27.2"
     env:
       MISE_GO_VERSION: "{{matrix}}"
     command:
       - test -z "$(gofmt -l .)"
       - go vet ./...
       - go test -race ./...
+      - go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
     plugins:
       - mise#v1.1.5: ~

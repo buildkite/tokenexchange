@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -779,38 +780,44 @@ func TestNewCachedSourceGraceTreatsNegativeAsZero(t *testing.T) {
 }
 
 func TestCachedSourceRefreshesWithinGrace(t *testing.T) {
-	key := testKey(t)
-	// 30s TTL with a 60s grace window => always considered stale => refetch.
-	srv, calls := fakeEndpoint(t, key, 30)
-	src := NewCachedSourceGrace(newExchanger(key, srv.URL), 60*time.Second)
-
-	for i := 0; i < 2; i++ {
-		if _, err := src.Token(context.Background()); err != nil {
-			t.Fatalf("Token: %v", err)
-		}
-	}
-	if got := atomic.LoadInt32(calls); got != 2 {
-		t.Errorf("endpoint called %d times, want 2 (always within grace)", got)
-	}
-}
-
-func TestCachedSourceWarnsOnShortTTL(t *testing.T) {
-	key := testKey(t)
-	// 30s TTL with a 60s grace => token is always stale => cache thrash.
-	srv, _ := fakeEndpoint(t, key, 30)
-
-	var buf bytes.Buffer
-	src := NewCachedSourceGrace(newExchanger(key, srv.URL), 60*time.Second)
-	src.Logger = slog.New(slog.NewTextHandler(&buf, nil))
-
-	for i := 0; i < 3; i++ {
-		if _, err := src.Token(context.Background()); err != nil {
-			t.Fatalf("Token: %v", err)
-		}
-	}
-
-	if n := strings.Count(buf.String(), "caching is ineffective"); n != 1 {
-		t.Errorf("warning logged %d times, want exactly 1; log=%q", n, buf.String())
+	for _, tt := range []struct {
+		name         string
+		lifetime     time.Duration
+		grace        time.Duration
+		refreshAfter time.Duration
+	}{
+		{name: "short TTL", lifetime: 30 * time.Second, grace: time.Minute, refreshAfter: 15 * time.Second},
+		{name: "twice grace", lifetime: 2 * time.Minute, grace: time.Minute, refreshAfter: time.Minute},
+		{name: "long TTL", lifetime: 10 * time.Minute, grace: time.Minute, refreshAfter: 9 * time.Minute},
+		{name: "zero grace", lifetime: 30 * time.Second, refreshAfter: 30 * time.Second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			start := time.Date(2026, time.October, 14, 0, 0, 0, 0, time.UTC)
+			now := start
+			calls := 0
+			src := NewCachedSourceGrace(sourceFunc(func(context.Context) (*Token, error) {
+				calls++
+				return &Token{accessToken: fmt.Sprintf("bktx_%d", calls), expiresAt: now.Add(tt.lifetime)}, nil
+			}), tt.grace)
+			src.now = func() time.Time { return now }
+			first, err := src.Token(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, elapsed := range []time.Duration{0, tt.refreshAfter - time.Nanosecond} {
+				now = start.Add(elapsed)
+				if tok, err := src.Token(context.Background()); err != nil || tok != first {
+					t.Fatalf("lookup at %s = (%v, %v), want cached token", elapsed, tok, err)
+				}
+			}
+			if calls != 1 {
+				t.Fatalf("source called %d times before refresh boundary, want 1", calls)
+			}
+			now = start.Add(tt.refreshAfter)
+			if tok, err := src.Token(context.Background()); err != nil || tok == first || calls != 2 {
+				t.Fatalf("lookup at refresh boundary = (%v, %v), calls=%d, want new token", tok, err, calls)
+			}
+		})
 	}
 }
 
@@ -855,6 +862,7 @@ func TestCachedSourceUsesUnexpiredTokenDuringRefreshBackoff(t *testing.T) {
 	if tok, err := src.Token(context.Background()); err != nil || tok != oldToken {
 		t.Fatalf("initial Token = (%v, %v), want old token", tok, err)
 	}
+	now = now.Add(15 * time.Second)
 	if tok, err := src.Token(context.Background()); err != nil || tok != oldToken {
 		t.Fatalf("failed refresh Token = (%v, %v), want old token", tok, err)
 	}
@@ -884,7 +892,7 @@ func TestCachedSourceUsesUnexpiredTokenDuringRefreshBackoff(t *testing.T) {
 	if got := atomic.LoadInt32(&calls); got != 4 {
 		t.Errorf("source called %d times, want 4", got)
 	}
-	if got := strings.Count(logs.String(), "token refresh failed; using cached token"); got != 2 {
+	if got := strings.Count(logs.String(), "token refresh failed"); got != 2 {
 		t.Errorf("refresh failure logged %d times, want 2; log=%q", got, logs.String())
 	}
 	if got := strings.Count(logs.String(), "token refresh recovered"); got != 1 {
@@ -910,7 +918,7 @@ func TestRefreshRetryBackoff(t *testing.T) {
 	}
 }
 
-func TestCachedSourceCapsRefreshBackoffAtExpiry(t *testing.T) {
+func TestCachedSourceKeepsRefreshBackoffAfterExpiry(t *testing.T) {
 	now := time.Date(2026, time.August, 4, 12, 0, 0, 0, time.UTC)
 	oldToken := &Token{accessToken: "bktx_old", expiresAt: now.Add(500 * time.Millisecond)}
 	refreshErr := errors.New("token endpoint unavailable")
@@ -927,11 +935,16 @@ func TestCachedSourceCapsRefreshBackoffAtExpiry(t *testing.T) {
 	if _, err := src.Token(context.Background()); err != nil {
 		t.Fatalf("initial Token: %v", err)
 	}
+	now = now.Add(250 * time.Millisecond)
 	if tok, err := src.Token(context.Background()); err != nil || tok != oldToken {
 		t.Fatalf("failed refresh Token = (%v, %v), want old token", tok, err)
 	}
-	if !src.retryAt.Equal(oldToken.expiresAt) {
-		t.Errorf("retryAt = %s, want token expiry %s", src.retryAt, oldToken.expiresAt)
+	now = now.Add(250 * time.Millisecond)
+	if tok, err := src.Token(context.Background()); tok != nil || !errors.Is(err, refreshErr) {
+		t.Fatalf("expired lookup during backoff = (%v, %v), want refresh error", tok, err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("source called %d times during backoff, want 2", got)
 	}
 }
 
@@ -953,6 +966,7 @@ func TestCachedSourceReturnsRefreshErrorAfterExpiry(t *testing.T) {
 	if _, err := src.Token(context.Background()); err != nil {
 		t.Fatalf("initial Token: %v", err)
 	}
+	now = now.Add(500 * time.Millisecond)
 	if _, err := src.Token(context.Background()); !errors.Is(err, refreshErr) {
 		t.Fatalf("Token error = %v, want %v", err, refreshErr)
 	}
@@ -1002,6 +1016,7 @@ func TestCachedSourceServesUnexpiredTokenDuringRefresh(t *testing.T) {
 	if _, err := src.Token(context.Background()); err != nil {
 		t.Fatalf("initial Token: %v", err)
 	}
+	now = now.Add(15 * time.Second)
 
 	refreshResult := make(chan tokenResult, 1)
 	go func() {
@@ -1472,5 +1487,152 @@ func TestExpiresInParameter(t *testing.T) {
 	}
 	if gotExpiresIn != "1" {
 		t.Errorf("expires_in = %q, want 1", gotExpiresIn)
+	}
+}
+
+func TestExchangerAccountsForResponseLatency(t *testing.T) {
+	for _, delay := range []time.Duration{5 * time.Second, 30 * time.Second} {
+		t.Run(delay.String(), func(t *testing.T) {
+			start := time.Date(2026, time.October, 14, 0, 0, 0, 0, time.UTC)
+			now := start
+			ex := newExchanger(testKey(t), "https://token.example.test")
+			ex.now = func() time.Time { return now }
+			ex.HTTPClient = &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				now = now.Add(delay)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(`{"access_token":"bktx_latency","issued_token_type":"urn:ietf:params:oauth:token-type:access_token","token_type":"Bearer","expires_in":30}`)),
+					Header:     make(http.Header), Request: req,
+				}, nil
+			})}
+			tok, err := ex.Token(context.Background())
+			if delay == 30*time.Second {
+				if err == nil || tok != nil {
+					t.Fatalf("expired response = (%v, %v), want error and no token", tok, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := start.Add(30 * time.Second); !tok.Expiry().Equal(want) {
+				t.Errorf("expiry = %s, want %s", tok.Expiry(), want)
+			}
+		})
+	}
+}
+
+func TestExchangerRejectsRedirects(t *testing.T) {
+	for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			var forwarded atomic.Int32
+			destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				forwarded.Add(1)
+				w.WriteHeader(http.StatusBadRequest)
+			}))
+			defer destination.Close()
+			origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, destination.URL, status)
+			}))
+			defer origin.Close()
+			ex := newExchanger(testKey(t), origin.URL)
+			for _, custom := range []bool{false, true} {
+				var policyCalls int
+				if custom {
+					ex.HTTPClient = &http.Client{Timeout: time.Second, CheckRedirect: func(*http.Request, []*http.Request) error {
+						policyCalls++
+						return nil
+					}}
+				}
+				if tok, err := ex.Token(context.Background()); err == nil || tok != nil {
+					t.Fatalf("redirect returned (%v, %v), want error and no token", tok, err)
+				}
+				if policyCalls != 0 {
+					t.Error("token exchange invoked caller's redirect policy")
+				}
+				if custom {
+					_ = ex.HTTPClient.CheckRedirect(nil, nil)
+					if policyCalls != 1 || ex.HTTPClient.Timeout != time.Second {
+						t.Error("token exchange mutated caller's HTTP client")
+					}
+				}
+			}
+			if forwarded.Load() != 0 {
+				t.Fatalf("redirect destination received %d requests", forwarded.Load())
+			}
+		})
+	}
+}
+
+func TestCachedSourceBacksOffWithoutUsableToken(t *testing.T) {
+	for _, seeded := range []bool{false, true} {
+		t.Run(fmt.Sprint(seeded), func(t *testing.T) {
+			now := time.Date(2026, time.October, 14, 0, 0, 0, 0, time.UTC)
+			old := &Token{accessToken: "bktx_old", expiresAt: now.Add(time.Minute)}
+			fresh := &Token{accessToken: "bktx_new", expiresAt: now.Add(time.Hour)}
+			failure := &TokenError{Code: "temporarily_unavailable", StatusCode: http.StatusTooManyRequests}
+			calls := 0
+			src := NewCachedSource(sourceFunc(func(context.Context) (*Token, error) {
+				calls++
+				if seeded && calls == 1 {
+					return old, nil
+				}
+				if calls <= 2 {
+					return nil, failure
+				}
+				return fresh, nil
+			}))
+			src.now = func() time.Time { return now }
+			if seeded {
+				if _, err := src.Token(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				now = now.Add(time.Minute)
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				if tok, err := src.Token(context.Background()); tok != nil || !errors.Is(err, failure) {
+					t.Fatalf("failed lookup = (%v, %v), want original error and no token", tok, err)
+				}
+			}
+			wantCalls := 1
+			if seeded {
+				wantCalls++
+			}
+			if calls != wantCalls {
+				t.Fatalf("calls during backoff = %d, want %d", calls, wantCalls)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			if _, err := src.Token(ctx); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled lookup = %v, want context.Canceled", err)
+			}
+			now = now.Add(time.Second)
+			if !seeded {
+				if _, err := src.Token(context.Background()); !errors.Is(err, failure) {
+					t.Fatal(err)
+				}
+				now = now.Add(2 * time.Second)
+			}
+			if tok, err := src.Token(context.Background()); err != nil || tok != fresh {
+				t.Fatalf("recovery = (%v, %v), want fresh token", tok, err)
+			}
+		})
+	}
+}
+
+func TestTokenFormattingRedactsCredentials(t *testing.T) {
+	tok := Token{accessToken: "bktx_do_not_log", expiresAt: time.Now().Add(time.Hour)}
+	for _, value := range []any{tok, &tok} {
+		for _, format := range []string{"%v", "%+v", "%#v"} {
+			if output := fmt.Sprintf(format, value); strings.Contains(output, tok.AccessToken()) {
+				t.Errorf("%s exposed credential", format)
+			}
+		}
+		var output bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&output, nil))
+		logger.Info("token", "token", value)
+		if strings.Contains(output.String(), tok.AccessToken()) {
+			t.Error("slog exposed credential")
+		}
 	}
 }

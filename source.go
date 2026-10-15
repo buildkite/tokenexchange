@@ -9,8 +9,8 @@ import (
 )
 
 const (
-	// DefaultRefreshGrace is how far before expiry a [CachedSource]
-	// proactively refreshes its token.
+	// DefaultRefreshGrace is the maximum time before expiry at which a
+	// [CachedSource] proactively refreshes its token.
 	DefaultRefreshGrace = 60 * time.Second
 
 	refreshRetryInitial = time.Second
@@ -49,17 +49,17 @@ type CachedSource struct {
 	source Source
 	grace  time.Duration
 
-	// Logger, if non-nil, reports refresh failures and recovery. It also
-	// receives a one-time Warn when a freshly minted token has a lifetime no
-	// longer than the refresh grace window. Defaults to nil (no logging).
+	// Logger, if non-nil, reports refresh failures and recovery.
+	// Defaults to nil (no logging).
 	Logger *slog.Logger
 
 	mu              sync.Mutex
 	current         *Token
+	refreshGrace    time.Duration
 	retryAt         time.Time
+	refreshErr      error
 	refreshFailures int
 	refreshing      *refreshCall
-	warnOnce        sync.Once
 	now             func() time.Time
 }
 
@@ -70,8 +70,9 @@ func NewCachedSource(source Source) *CachedSource {
 }
 
 // NewCachedSourceGrace returns a CachedSource that refreshes its token once it
-// is within grace of expiry. A grace of zero refreshes only after expiry;
-// negative values are treated as zero.
+// is within grace of expiry. The effective grace is capped at half the token's
+// remaining lifetime when cached, so short-lived tokens can still be reused.
+// A grace of zero refreshes only after expiry; negative values are treated as zero.
 func NewCachedSourceGrace(source Source, grace time.Duration) *CachedSource {
 	if grace < 0 {
 		grace = 0
@@ -94,6 +95,7 @@ func (c *CachedSource) InvalidateToken(tok *Token) {
 	}
 	c.current = nil
 	c.retryAt = time.Time{}
+	c.refreshErr = nil
 	c.refreshFailures = 0
 	source := c.source
 	c.mu.Unlock()
@@ -106,6 +108,7 @@ func (c *CachedSource) InvalidateToken(tok *Token) {
 // Token returns the cached token if it is still valid, otherwise it mints and
 // caches a fresh one. If a proactive refresh fails, the existing token is
 // returned while it remains unexpired and refreshes are retried with backoff.
+// Without an unexpired token, the last refresh error is returned during backoff.
 // Concurrent refreshes are coalesced. Callers continue using an unexpired token
 // while a refresh is in progress; callers waiting for a required refresh can
 // stop waiting by canceling their context.
@@ -115,17 +118,25 @@ func (c *CachedSource) Token(ctx context.Context) (*Token, error) {
 	}
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		c.mu.Lock()
 		now := c.clock()
-		if c.current.validAt(now, c.grace) {
+		if c.current.validAt(now, c.refreshGrace) {
 			tok := c.current
 			c.mu.Unlock()
 			return tok, nil
 		}
-		if c.current.validAt(now, 0) && now.Before(c.retryAt) {
-			tok := c.current
+		if now.Before(c.retryAt) {
+			if c.current.validAt(now, 0) {
+				tok := c.current
+				c.mu.Unlock()
+				return tok, nil
+			}
+			err := c.refreshErr
 			c.mu.Unlock()
-			return tok, nil
+			return nil, err
 		}
 
 		if call := c.refreshing; call != nil {
@@ -150,10 +161,6 @@ func (c *CachedSource) Token(ctx context.Context) (*Token, error) {
 		if c.source == nil {
 			c.mu.Unlock()
 			return nil, fmt.Errorf("tokenexchange: CachedSource source is nil")
-		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			c.mu.Unlock()
-			return nil, ctxErr
 		}
 
 		call := &refreshCall{done: make(chan struct{})}
@@ -195,8 +202,8 @@ func (c *CachedSource) finishRefresh(ctx context.Context, tok *Token, err error)
 		}
 
 		now := c.clock()
+		c.deferRefresh(now, err)
 		if c.current.validAt(now, 0) {
-			c.deferRefresh(now, err)
 			return c.current, nil, false
 		}
 		return nil, err, false
@@ -204,9 +211,10 @@ func (c *CachedSource) finishRefresh(ctx context.Context, tok *Token, err error)
 
 	failedAttempts := c.refreshFailures
 	c.current = tok
+	c.refreshGrace = min(c.grace, tok.expiresAt.Sub(c.clock())/2)
 	c.retryAt = time.Time{}
+	c.refreshErr = nil
 	c.refreshFailures = 0
-	c.warnIfThrashing(tok, c.clock())
 	if c.Logger != nil && failedAttempts > 0 {
 		c.Logger.Info("tokenexchange: token refresh recovered",
 			"failed_attempts", failedAttempts,
@@ -226,14 +234,12 @@ func (c *CachedSource) deferRefresh(now time.Time, refreshErr error) {
 	c.refreshFailures++
 	delay := refreshRetryBackoff(c.refreshFailures)
 	c.retryAt = now.Add(delay)
-	if c.retryAt.After(c.current.expiresAt) {
-		c.retryAt = c.current.expiresAt
-	}
+	c.refreshErr = refreshErr
 
 	if c.Logger != nil {
-		c.Logger.Warn("tokenexchange: token refresh failed; using cached token",
+		c.Logger.Warn("tokenexchange: token refresh failed",
 			"error", refreshErr,
-			"token_expires_at", c.current.expiresAt,
+			"using_cached_token", c.current.validAt(now, 0),
 			"retry_at", c.retryAt,
 		)
 	}
@@ -248,22 +254,4 @@ func refreshRetryBackoff(failures int) time.Duration {
 		return refreshRetryMax
 	}
 	return delay
-}
-
-// warnIfThrashing logs a single warning if the minted token's lifetime is no
-// longer than the grace window, causing sequential lookups to keep refreshing.
-func (c *CachedSource) warnIfThrashing(tok *Token, now time.Time) {
-	if c.Logger == nil || c.grace <= 0 {
-		return
-	}
-	lifetime := tok.expiresAt.Sub(now)
-	if lifetime > c.grace {
-		return
-	}
-	c.warnOnce.Do(func() {
-		c.Logger.Warn("tokenexchange: minted token lifetime does not exceed the cache refresh grace; caching is ineffective for sequential lookups, which will repeatedly attempt refreshes",
-			"token_lifetime", lifetime.Round(time.Second),
-			"refresh_grace", c.grace,
-		)
-	})
 }

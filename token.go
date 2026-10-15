@@ -13,6 +13,12 @@ type Token struct {
 	expiresAt   time.Time
 }
 
+// String redacts the bearer credential when a token is formatted or logged.
+func (t Token) String() string { return "tokenexchange.Token{redacted}" }
+
+// GoString also redacts the credential when formatted with %#v.
+func (t Token) GoString() string { return t.String() }
+
 // AccessToken returns the bearer token value (prefixed "bktx_").
 func (t *Token) AccessToken() string { return t.accessToken }
 

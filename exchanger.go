@@ -80,7 +80,10 @@ type Exchanger struct {
 	// also used as the JWT "aud" claim.
 	Endpoint string
 
-	// HTTPClient performs the token request. Defaults to http.DefaultClient.
+	// HTTPClient performs the token request. If nil, a copy of http.DefaultClient
+	// with a 30-second timeout is used. Redirects are always rejected to prevent
+	// forwarding assertions; a supplied client's redirect policy is not used.
+	// The supplied client is never modified.
 	HTTPClient *http.Client
 
 	// now returns the current time; overridable in tests. Defaults to time.Now.
@@ -98,10 +101,15 @@ func (e *Exchanger) endpoint() string {
 }
 
 func (e *Exchanger) httpClient() *http.Client {
+	client := *http.DefaultClient
+	client.Timeout = 30 * time.Second
 	if e.HTTPClient != nil {
-		return e.HTTPClient
+		client = *e.HTTPClient
 	}
-	return http.DefaultClient
+	client.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &client
 }
 
 func (e *Exchanger) clock() time.Time {
@@ -239,6 +247,7 @@ func (e *Exchanger) exchange(ctx context.Context, assertion string) (*Token, err
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
+	startedAt := e.clock()
 	resp, err := e.httpClient().Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("tokenexchange: token request: %w", err)
@@ -294,7 +303,10 @@ func (e *Exchanger) exchange(ctx context.Context, assertion string) (*Token, err
 	tok := &Token{
 		accessToken: tr.AccessToken,
 		tokenType:   "Bearer",
-		expiresAt:   e.clock().Add(time.Duration(tr.ExpiresIn) * time.Second),
+		expiresAt:   startedAt.Add(time.Duration(tr.ExpiresIn) * time.Second),
+	}
+	if !tok.validAt(e.clock(), 0) {
+		return nil, fmt.Errorf("tokenexchange: token expired before the exchange completed")
 	}
 	if tr.Scope != "" {
 		tok.scopes = strings.Fields(tr.Scope)

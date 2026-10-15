@@ -78,8 +78,8 @@ func main() {
 		HTTPClient: &http.Client{Timeout: 10 * time.Second},
 	}
 
-	// CachedSource reuses the token until it nears expiry. The Logger warns if
-	// the token TTL is too short to cache effectively (e.g. -expires-in 30s).
+	// CachedSource reuses tokens, including short-lived ones. The Logger reports
+	// refresh failures and recovery.
 	source := tokenexchange.NewCachedSource(exchanger)
 	source.Logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
