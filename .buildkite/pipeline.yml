@@ -1,3 +1,8 @@
+agents:
+  queue: hosted
+
+cache: ".buildkite/cache-volume"
+
 steps:
   - label: ":go: Verify Go {{matrix}}"
     matrix:
