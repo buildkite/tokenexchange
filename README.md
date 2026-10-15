@@ -78,7 +78,7 @@ Origins must use the form `scheme://host`, including a port when required.
 
 Calling `Exchanger.Token` always performs a network request. `CachedSource` keeps the token in memory, coalesces concurrent refreshes, and refreshes before expiry as recommended by Buildkite.
 
-The default refresh grace is 60 seconds. For shorter token lifetimes, use `NewCachedSourceGrace`; otherwise every lookup may attempt a refresh. You can also attach an `*slog.Logger` to `CachedSource` to see refresh failures and recovery.
+The default refresh grace is 60 seconds, capped at half the token's remaining lifetime when cached. Use `NewCachedSourceGrace` to customize it. You can also attach an `*slog.Logger` to `CachedSource` to see refresh failures and recovery.
 
 If a proactive refresh fails, an unexpired token remains available while refreshes are retried with backoff. A `401 Unauthorized` response invalidates the cached token for the next request. The failed request is not retried.
 

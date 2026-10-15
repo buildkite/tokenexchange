@@ -6,7 +6,7 @@ A small Go reverse proxy that authenticates a demo credential, mints a short-liv
 
 ## Run
 
-Requires Go 1.25+ and an Enterprise organization with Token Exchange enabled.
+Requires Go 1.26.9+ and an Enterprise organization with Token Exchange enabled.
 
 From the repository root:
 
